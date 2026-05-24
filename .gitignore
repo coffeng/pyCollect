@@ -1,4 +1,5 @@
 *.csv
 *.drc
 __pycache__/
+.venv/
 drc_2_csv_*.log
