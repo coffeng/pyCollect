@@ -188,6 +188,8 @@ def load_signal_config(base_dir, config_path=None):
     initial_duration = int(ui_cfg.get("duration_sec", 60))
     initial_trend_window = float(ui_cfg.get("trend_window_sec", 60))
     initial_wave_window = float(ui_cfg.get("wave_window_sec", 10))
+    sim_cfg = ui_cfg.get("simulator", {})
+    initial_sim_speed = float(sim_cfg.get("speed_multiplier", 1.0))
 
     return {
         "path": str(cfg_path),
@@ -198,6 +200,7 @@ def load_signal_config(base_dir, config_path=None):
         "initial_duration": max(5, initial_duration),
         "initial_trend_window": max(10.0, initial_trend_window),
         "initial_wave_window": max(10.0, initial_wave_window),
+        "initial_sim_speed": max(0.05, min(20.0, initial_sim_speed)),
     }
 
 
@@ -700,28 +703,40 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         left.setContentsMargins(10, 10, 10, 10)
         left.setSpacing(8)
 
-        title = QtWidgets.QLabel("Capture Control")
+        title = QtWidgets.QLabel("Bedside Monitor Workflow")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         left.addWidget(title)
 
-        self.conn_section = CollapsibleSection("Connection", expanded=True)
+        def _hint(text):
+            label = QtWidgets.QLabel(text)
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #3e4a5a; font-size: 11px;")
+            return label
+
+        self.conn_section = CollapsibleSection(
+            "Monitor Connection",
+            expanded=True,
+        )
         left.addWidget(self.conn_section)
         self.port_combo = QtWidgets.QComboBox()
         self.refresh_ports_btn = QtWidgets.QPushButton("Refresh Ports")
         self.conn_section.content_layout.addWidget(
-            QtWidgets.QLabel("Serial Port")
+            QtWidgets.QLabel("Source Port")
         )
         self.conn_section.content_layout.addWidget(self.port_combo)
         self.conn_section.content_layout.addWidget(self.refresh_ports_btn)
+        self.conn_section.content_layout.addWidget(
+            _hint("Next: confirm monitor source and move to signal setup.")
+        )
 
-        view_section = CollapsibleSection("Display Windows", expanded=True)
+        view_section = CollapsibleSection("Session Setup", expanded=True)
         left.addWidget(view_section)
 
         self.duration_spin = QtWidgets.QSpinBox()
         self.duration_spin.setRange(5, 3600)
         self.duration_spin.setValue(self.config["initial_duration"])
         view_section.content_layout.addWidget(
-            QtWidgets.QLabel("Duration (sec)")
+            QtWidgets.QLabel("Record Duration (sec)")
         )
         view_section.content_layout.addWidget(self.duration_spin)
 
@@ -729,7 +744,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.hr_window_spin.setRange(10, 3600)
         self.hr_window_spin.setValue(int(self.config["initial_trend_window"]))
         view_section.content_layout.addWidget(
-            QtWidgets.QLabel("Trend Time Length (sec)")
+            QtWidgets.QLabel("Vitals Window (sec)")
         )
         view_section.content_layout.addWidget(self.hr_window_spin)
 
@@ -738,19 +753,28 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.ecg_window_spin.setSingleStep(0.5)
         self.ecg_window_spin.setValue(self.config["initial_wave_window"])
         view_section.content_layout.addWidget(
-            QtWidgets.QLabel("Wave Time Length (sec, 10..300)")
+            QtWidgets.QLabel("Waveform Window (sec, 10..300)")
         )
         view_section.content_layout.addWidget(self.ecg_window_spin)
+        view_section.content_layout.addWidget(
+            _hint("Next: select waveforms and start monitoring.")
+        )
 
-        self.capture_section = CollapsibleSection("Capture", expanded=True)
+        self.capture_section = CollapsibleSection(
+            "Monitoring Control",
+            expanded=True,
+        )
         left.addWidget(self.capture_section)
-        self.start_btn = QtWidgets.QPushButton("Start Capture")
-        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.start_btn = QtWidgets.QPushButton("Start Monitoring")
+        self.stop_btn = QtWidgets.QPushButton("Stop Monitoring")
         self.stop_btn.setEnabled(False)
         self.capture_section.content_layout.addWidget(self.start_btn)
         self.capture_section.content_layout.addWidget(self.stop_btn)
+        self.capture_section.content_layout.addWidget(
+            _hint("Start to begin bedside recording.")
+        )
 
-        signal_section = CollapsibleSection("Signal Selection", expanded=True)
+        signal_section = CollapsibleSection("Signal Setup", expanded=True)
         left.addWidget(signal_section)
         selector_grid = QtWidgets.QGridLayout()
         selector_grid.setContentsMargins(0, 0, 0, 0)
@@ -780,7 +804,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 )
             )
 
-        status_section = CollapsibleSection("Status", expanded=True)
+        status_section = CollapsibleSection("Recorder Output", expanded=True)
         left.addWidget(status_section)
         self.status_box = QtWidgets.QPlainTextEdit()
         self.status_box.setReadOnly(True)
@@ -792,12 +816,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # _wave_request_button_state() for transitions. Displayed rows are
         # auto-requested and protected from being unrequested.
         self.wave_catalog_section = CollapsibleSection(
-            "Waveform Request Catalog",
+            "Waveform Status",
             expanded=False,
         )
         left.insertWidget(
             left.indexOf(view_section),
             self.wave_catalog_section,
+        )
+        self.wave_catalog_section.content_layout.addWidget(
+            _hint(
+                "Legend: green receiving, yellow delayed, red missing, "
+                "blue pending request."
+            )
         )
         catalog_scroll = QtWidgets.QScrollArea()
         catalog_scroll.setWidgetResizable(True)
@@ -828,6 +858,22 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         catalog_scroll.setWidget(catalog_inner)
         self.wave_catalog_section.content_layout.addWidget(catalog_scroll)
+
+        self.advanced_section = CollapsibleSection("Advanced", expanded=False)
+        left.addWidget(self.advanced_section)
+        self.sim_speed_spin = QtWidgets.QDoubleSpinBox()
+        self.sim_speed_spin.setRange(0.05, 20.0)
+        self.sim_speed_spin.setSingleStep(0.05)
+        self.sim_speed_spin.setValue(self.config["initial_sim_speed"])
+        self.advanced_section.content_layout.addWidget(
+            QtWidgets.QLabel("Simulator Replay Speed (x)")
+        )
+        self.advanced_section.content_layout.addWidget(self.sim_speed_spin)
+        self.advanced_section.content_layout.addWidget(
+            _hint(
+                "Updates ui.simulator.speed_multiplier in config on close."
+            )
+        )
 
         left.addStretch(1)
         layout.addWidget(self.sidebar)
@@ -1576,10 +1622,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         data.setdefault("signal_sources", {})
         data.setdefault("ui", {})
         data.setdefault("channels", {})
+        data["ui"].setdefault("simulator", {})
 
         data["ui"]["duration_sec"] = int(self.duration_spin.value())
         data["ui"]["trend_window_sec"] = int(self.hr_window_spin.value())
         data["ui"]["wave_window_sec"] = float(self.ecg_window_spin.value())
+        data["ui"]["simulator"]["speed_multiplier"] = float(
+            self.sim_speed_spin.value()
+        )
 
         data["channels"]["trends"] = [
             {"row_identifier": int(item["row_identifier"])}
