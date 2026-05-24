@@ -278,6 +278,7 @@ class CollectorWorker(QtCore.QThread):
 
     def _extract_trends(self, payload):
         out = {}
+        all_values = {}
         subgroup_values = {}
         positive_rows = set()
 
@@ -319,6 +320,7 @@ class CollectorWorker(QtCore.QThread):
             if raw_value == pycollect.DATA_INVALID:
                 continue
             scaled = float(raw_value) / item["divider"]
+            all_values[item["row_identifier"]] = scaled
             if scaled > 0:
                 positive_rows.add(item["row_identifier"])
 
@@ -335,7 +337,7 @@ class CollectorWorker(QtCore.QThread):
 
             out[item["id"]] = float(raw_value) / item["divider"]
 
-        return out, positive_rows
+        return out, positive_rows, all_values
 
     def _extract_waves(self, payload):
         out = {}
@@ -394,7 +396,13 @@ class CollectorWorker(QtCore.QThread):
 
     def _extract_from_record(self, record_data):
         if len(record_data) < 40:
-            return {"trends": {}, "waves": {}}
+            return {
+                "trends": {},
+                "trend_rows": {},
+                "waves": {},
+                "positive_trend_rows": [],
+                "positive_wave_rows": [],
+            }
 
         header_fmt = "< h b b H I b b H h " + "h b" * pycollect.DRI_MAX_SUBRECS
         header_struct = pycollect.struct.Struct(header_fmt)
@@ -402,12 +410,24 @@ class CollectorWorker(QtCore.QThread):
         try:
             header = header_struct.unpack(record_data[:40])
         except Exception:
-            return {"trends": {}, "waves": {}}
+            return {
+                "trends": {},
+                "trend_rows": {},
+                "waves": {},
+                "positive_trend_rows": [],
+                "positive_wave_rows": [],
+            }
 
         r_len = header[0]
         r_maintype = header[8]
         if r_len < 40 or r_len > len(record_data):
-            return {"trends": {}, "waves": {}}
+            return {
+                "trends": {},
+                "trend_rows": {},
+                "waves": {},
+                "positive_trend_rows": [],
+                "positive_wave_rows": [],
+            }
 
         sr_desc = header[9:]
         raw_offsets = sr_desc[::2]
@@ -425,9 +445,12 @@ class CollectorWorker(QtCore.QThread):
         }
 
         if r_maintype == 0:
-            trends, positive_trend_rows = self._extract_trends(parsed)
+            trends, positive_trend_rows, all_trend_rows = (
+                self._extract_trends(parsed)
+            )
             return {
                 "trends": trends,
+                "trend_rows": all_trend_rows,
                 "waves": {},
                 "positive_trend_rows": list(positive_trend_rows),
                 "positive_wave_rows": [],
@@ -436,12 +459,14 @@ class CollectorWorker(QtCore.QThread):
             waves, positive_wave_rows = self._extract_waves(parsed)
             return {
                 "trends": {},
+                "trend_rows": {},
                 "waves": waves,
                 "positive_trend_rows": [],
                 "positive_wave_rows": list(positive_wave_rows),
             }
         return {
             "trends": {},
+            "trend_rows": {},
             "waves": {},
             "positive_trend_rows": [],
             "positive_wave_rows": [],
@@ -545,6 +570,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self._in_splitter_adjust = False
 
         self.trend_buffers = {item["id"]: deque() for item in self.trend_defs}
+        self.trend_history_by_row = {}
         self.wave_buffers = {item["id"]: deque() for item in self.wave_defs}
         self.wave_cursors = {item["id"]: None for item in self.wave_defs}
 
@@ -554,6 +580,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_curves = {}
         self.slot_buttons = {}
         self.selector_popups = {}
+        self._trend_selector_slot_idx = None
         self.selector_filter_dirty = {
             "trend": True,
             "wave": True,
@@ -812,8 +839,79 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.slot_buttons[slot].setText(self._slot_label("W", item))
 
     def _prepare_selector_popups(self):
-        self.selector_popups["trend"] = self._build_selector_popup("trend")
+        self.selector_popups["trend"] = self._build_trend_grid_popup()
         self.selector_popups["wave"] = self._build_selector_popup("wave")
+
+    def _build_trend_grid_popup(self):
+        popup = QtWidgets.QDialog(self)
+        popup.setWindowTitle("Select Trend Parameter")
+        popup.resize(760, 520)
+        layout = QtWidgets.QVBoxLayout(popup)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        positive_only = QtWidgets.QCheckBox("Select only positive")
+        positive_only.setChecked(True)
+        layout.addWidget(positive_only)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        container = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+
+        columns = 5
+        total = len(self.all_trend_defs)
+        rows = max(1, int(math.ceil(float(total) / float(columns))))
+        trend_buttons = []
+        for idx, item in enumerate(self.all_trend_defs):
+            row = idx % rows
+            col = idx // rows
+            btn = QtWidgets.QPushButton(item["label"])
+            btn.setToolTip(
+                f"Row {item['row_identifier']} | "
+                f"{item['label']} [{item['unit']}]"
+            )
+            btn.clicked.connect(
+                lambda _checked=False, selected=dict(item):
+                self._on_trend_grid_pick(selected)
+            )
+            trend_buttons.append(
+                {
+                    "button": btn,
+                    "row_identifier": int(item["row_identifier"]),
+                }
+            )
+            grid.addWidget(btn, row, col)
+
+        scroll.setWidget(container)
+        positive_only.toggled.connect(
+            lambda _checked=False: self._apply_selector_filter(
+                "trend",
+                force=True,
+            )
+        )
+
+        return {
+            "dialog": popup,
+            "positive_only": positive_only,
+            "trend_buttons": trend_buttons,
+        }
+
+    def _on_trend_grid_pick(self, item):
+        if self._trend_selector_slot_idx is None:
+            return
+        self._apply_slot_selection(
+            "trend",
+            self._trend_selector_slot_idx,
+            item,
+        )
+        self._trend_selector_slot_idx = None
+        self.selector_popups["trend"]["dialog"].accept()
 
     def _build_selector_popup(self, category):
         popup = QtWidgets.QDialog(self, QtCore.Qt.Popup)
@@ -901,6 +999,27 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _apply_selector_filter(self, category, force=False):
         state = self.selector_popups[category]
+        if category == "trend" and "table" not in state:
+            use_positive = state["positive_only"].isChecked()
+            if (
+                not force
+                and use_positive
+                and not self.selector_filter_dirty[category]
+            ):
+                return
+
+            positive_rows = self.positive_trend_rows
+            for entry in state["trend_buttons"]:
+                row_id = entry["row_identifier"]
+                visible = True
+                if use_positive:
+                    visible = row_id in positive_rows
+                entry["button"].setVisible(visible)
+
+            if use_positive:
+                self.selector_filter_dirty[category] = False
+            return
+
         table = state["table"]
         use_positive = state["positive_only"].isChecked()
 
@@ -952,7 +1071,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             selected = dict(new_item)
             selected["id"] = slot_id
             self.trend_defs[slot_idx] = selected
-            self.trend_buffers[slot_id].clear()
+            self._sync_trend_slot_buffer(slot_idx)
             plot = self.trend_plots[slot_id]
         else:
             slot_id = f"wave{slot_idx + 1}"
@@ -966,11 +1085,40 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         plot.setTitle(selected["title"])
         plot.setLabel("left", text=selected["label"], units=selected["unit"])
         self.refresh_slot_buttons()
-        self.update_plots(force=True)
+        if category == "trend":
+            self.update_plots()
+        else:
+            self.update_plots(force=True)
         self.log(f"Updated {slot_id} to row {selected['row_identifier']}")
 
+    def _sync_trend_slot_buffer(self, slot_idx):
+        slot_id = f"trend{slot_idx + 1}"
+        row_id = self.trend_defs[slot_idx]["row_identifier"]
+        history = self.trend_history_by_row.get(row_id)
+        if history is None:
+            self.trend_buffers[slot_id].clear()
+            return
+        self.trend_buffers[slot_id] = deque(history)
+
     def open_slot_selector(self, category, slot_idx):
-        if self.worker is not None and self.worker.isRunning():
+        if category == "trend":
+            self._trend_selector_slot_idx = slot_idx
+            slot_name = f"trend{slot_idx + 1}"
+            parent_button = self.slot_buttons[slot_name]
+            dialog = self.selector_popups["trend"]["dialog"]
+            self._apply_selector_filter("trend", force=False)
+            dialog.move(
+                parent_button.mapToGlobal(parent_button.rect().bottomLeft())
+            )
+            dialog.exec_()
+            self._trend_selector_slot_idx = None
+            return
+
+        if (
+            category != "trend"
+            and self.worker is not None
+            and self.worker.isRunning()
+        ):
             self.log("Stop capture before changing signal selections")
             return
 
@@ -1043,6 +1191,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
 
         self.logical_now_sec = 0.0
+        self.trend_history_by_row.clear()
         for values in self.trend_buffers.values():
             values.clear()
         for values in self.wave_buffers.values():
@@ -1089,7 +1238,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def on_package(self, payload):
         rel_t = float(payload.get("time", 0.0))
 
-        trends = payload.get("trends", {})
+        trend_rows = payload.get("trend_rows", {})
         waves = payload.get("waves", {})
         positive_trend_rows = payload.get("positive_trend_rows", [])
         positive_wave_rows = payload.get("positive_wave_rows", [])
@@ -1106,10 +1255,24 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if self.simulation_mode:
             self.sim_idle_timer.start()
 
-        for item in self.trend_defs:
-            val = trends.get(item["id"])
-            if val is not None and not math.isnan(val):
-                self.trend_buffers[item["id"]].append((rel_t, val))
+        trend_window, _wave_window = self._effective_windows()
+        for row_key, val in trend_rows.items():
+            if val is None or math.isnan(val):
+                continue
+            row_id = int(row_key)
+            history = self.trend_history_by_row.get(row_id)
+            if history is None:
+                history = deque()
+                self.trend_history_by_row[row_id] = history
+            history.append((rel_t, float(val)))
+
+        cutoff = rel_t - trend_window
+        for history in self.trend_history_by_row.values():
+            while history and history[0][0] < cutoff:
+                history.popleft()
+
+        for idx in range(len(self.trend_defs)):
+            self._sync_trend_slot_buffer(idx)
 
         max_wave_t = rel_t
         for item in self.wave_defs:
@@ -1234,6 +1397,44 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_stop()
         QtCore.QTimer.singleShot(800, self.close)
+
+    def _save_runtime_config(self):
+        cfg_path = Path(self.config.get("path", ""))
+        if not cfg_path:
+            return
+
+        data = {}
+        if cfg_path.exists():
+            try:
+                data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+
+        data.setdefault("signal_sources", {})
+        data.setdefault("ui", {})
+        data.setdefault("channels", {})
+
+        data["ui"]["duration_sec"] = int(self.duration_spin.value())
+        data["ui"]["trend_window_sec"] = int(self.hr_window_spin.value())
+        data["ui"]["wave_window_sec"] = float(self.ecg_window_spin.value())
+
+        data["channels"]["trends"] = [
+            {"row_identifier": int(item["row_identifier"])}
+            for item in self.trend_defs
+        ]
+        data["channels"]["waves"] = [
+            {"row_identifier": int(item["row_identifier"])}
+            for item in self.wave_defs
+        ]
+
+        cfg_path.write_text(
+            json.dumps(data, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def closeEvent(self, event):
+        self._save_runtime_config()
+        super().closeEvent(event)
 
 
 def main():

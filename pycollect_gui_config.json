@@ -5,21 +5,37 @@
   },
   "ui": {
     "duration_sec": 60,
-    "trend_window_sec": 60,
-    "wave_window_sec": 10
+    "trend_window_sec": 20,
+    "wave_window_sec": 10.0
   },
   "channels": {
     "trends": [
-      { "row_identifier": 1 },
-      { "row_identifier": 30 },
-      { "row_identifier": 46 },
-      { "row_identifier": 52 }
+      {
+        "row_identifier": 1
+      },
+      {
+        "row_identifier": 6
+      },
+      {
+        "row_identifier": 46
+      },
+      {
+        "row_identifier": 34
+      }
     ],
     "waves": [
-      { "row_identifier": 1 },
-      { "row_identifier": 8 },
-      { "row_identifier": 13 },
-      { "row_identifier": 14 }
+      {
+        "row_identifier": 1
+      },
+      {
+        "row_identifier": 4
+      },
+      {
+        "row_identifier": 13
+      },
+      {
+        "row_identifier": 14
+      }
     ]
   }
 }
