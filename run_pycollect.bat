@@ -12,6 +12,7 @@ if "%~1"=="1" goto :opt1
 if "%~1"=="2" goto :opt2
 if "%~1"=="3" goto :opt3
 if "%~1"=="4" goto :opt4
+if "%~1"=="5" goto :opt5
 if "%~1"=="" goto :help
 
 echo Unknown option: %~1
@@ -45,6 +46,13 @@ echo   "%PY%" drc_2_csv.py "%ROOT%" "%ROOT%params5.txt" "%ROOT%waves5.txt"
 "%PY%" drc_2_csv.py "%ROOT%" "%ROOT%params5.txt" "%ROOT%waves5.txt"
 goto :eof
 
+:opt5
+echo [5] Qt GUI collector from real monitor (COM3)
+echo Command:
+echo   "%PY%" pycollect.py --qt-gui COM3 --output record.drc
+"%PY%" pycollect.py --qt-gui COM3 --output record.drc
+goto :eof
+
 :help
 echo.
 echo pyCollect launcher
@@ -55,6 +63,7 @@ echo   run_pycollect.bat 1
 echo   run_pycollect.bat 2
 echo   run_pycollect.bat 3
 echo   run_pycollect.bat 4
+echo   run_pycollect.bat 5
 echo   run_pycollect.bat help
 
 echo.
@@ -67,6 +76,8 @@ echo      (pycollect.py --qt-gui %GUI_PORT% --output record.drc --simulation-mod
 echo   3  Run simulator + Qt GUI together
 
 echo   4  Convert DRC files in this folder to CSV
+
+echo   5  Run Qt GUI collector from real monitor (COM3)
 
 echo   help  Show this message
 echo.
