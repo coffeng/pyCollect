@@ -4,7 +4,7 @@ import math
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyqtgraph as pg
@@ -190,6 +190,7 @@ def load_signal_config(base_dir, config_path=None):
     initial_wave_window = float(ui_cfg.get("wave_window_sec", 10))
     sim_cfg = ui_cfg.get("simulator", {})
     initial_sim_speed = float(sim_cfg.get("speed_multiplier", 1.0))
+    initial_split_ratio = float(ui_cfg.get("graph_split_ratio", 0.5))
 
     return {
         "path": str(cfg_path),
@@ -201,6 +202,7 @@ def load_signal_config(base_dir, config_path=None):
         "initial_trend_window": max(10.0, initial_trend_window),
         "initial_wave_window": max(10.0, initial_wave_window),
         "initial_sim_speed": max(0.05, min(20.0, initial_sim_speed)),
+        "initial_split_ratio": max(0.1, min(0.9, initial_split_ratio)),
     }
 
 
@@ -239,6 +241,7 @@ class CollapsibleSection(QtWidgets.QWidget):
 
 class CollectorWorker(QtCore.QThread):
     package_signal = QtCore.pyqtSignal(object)
+    wave_mapping_signal = QtCore.pyqtSignal(object)
     status_signal = QtCore.pyqtSignal(str)
     finished_signal = QtCore.pyqtSignal(str)
     error_signal = QtCore.pyqtSignal(str)
@@ -252,6 +255,7 @@ class CollectorWorker(QtCore.QThread):
         trend_defs,
         wave_defs,
         output_name="",
+        simulation_mode=False,
         parent=None,
     ):
         super().__init__(parent)
@@ -262,6 +266,7 @@ class CollectorWorker(QtCore.QThread):
         self.trend_defs = trend_defs
         self.wave_defs = wave_defs
         self.output_name = output_name
+        self.simulation_mode = bool(simulation_mode)
         self._stop_requested = False
         self.all_wave_by_type = {
             item["sr_type"]: item
@@ -272,6 +277,39 @@ class CollectorWorker(QtCore.QThread):
             for item in wave_defs
         }
         self.selected_wave_ids = [item["id"] for item in wave_defs]
+        self.dynamic_wave_types = [
+            item["sr_type"]
+            for item in wave_defs
+            if int(item.get("sr_type", 0)) > 0
+        ]
+
+    def _rebuild_wave_type_map(self):
+        self.selected_wave_types = {
+            sr_type: slot_id
+            for sr_type, slot_id in zip(
+                self.dynamic_wave_types,
+                self.selected_wave_ids,
+            )
+        }
+
+    def _auto_adapt_wave_mapping(self, sr_types_present):
+        if not self.simulation_mode:
+            return
+
+        changed = False
+        for sr_type in sr_types_present:
+            if sr_type <= 0:
+                continue
+            if sr_type in self.dynamic_wave_types:
+                continue
+            if len(self.dynamic_wave_types) >= len(self.selected_wave_ids):
+                continue
+            self.dynamic_wave_types.append(sr_type)
+            changed = True
+
+        if changed:
+            self._rebuild_wave_type_map()
+            self.wave_mapping_signal.emit(list(self.dynamic_wave_types))
 
     def request_stop(self):
         self._stop_requested = True
@@ -350,6 +388,8 @@ class CollectorWorker(QtCore.QThread):
             for idx, item in enumerate(payload["sr_types"])
             if item > 0
         ]
+        sr_types_present = [payload["sr_types"][idx] for idx in valid_indices]
+        self._auto_adapt_wave_mapping(sr_types_present)
 
         for pos, idx in enumerate(valid_indices):
             sr_type = payload["sr_types"][idx]
@@ -405,6 +445,7 @@ class CollectorWorker(QtCore.QThread):
                 "waves": {},
                 "positive_trend_rows": [],
                 "positive_wave_rows": [],
+                "record_time_unix": None,
             }
 
         header_fmt = "< h b b H I b b H h " + "h b" * pycollect.DRI_MAX_SUBRECS
@@ -419,9 +460,11 @@ class CollectorWorker(QtCore.QThread):
                 "waves": {},
                 "positive_trend_rows": [],
                 "positive_wave_rows": [],
+                "record_time_unix": None,
             }
 
         r_len = header[0]
+        r_time = header[4]
         r_maintype = header[8]
         if r_len < 40 or r_len > len(record_data):
             return {
@@ -430,6 +473,7 @@ class CollectorWorker(QtCore.QThread):
                 "waves": {},
                 "positive_trend_rows": [],
                 "positive_wave_rows": [],
+                "record_time_unix": None,
             }
 
         sr_desc = header[9:]
@@ -457,6 +501,7 @@ class CollectorWorker(QtCore.QThread):
                 "waves": {},
                 "positive_trend_rows": list(positive_trend_rows),
                 "positive_wave_rows": [],
+                "record_time_unix": int(r_time),
             }
         if r_maintype == 1:
             waves, positive_wave_rows = self._extract_waves(parsed)
@@ -466,6 +511,7 @@ class CollectorWorker(QtCore.QThread):
                 "waves": waves,
                 "positive_trend_rows": [],
                 "positive_wave_rows": list(positive_wave_rows),
+                "record_time_unix": int(r_time),
             }
         return {
             "trends": {},
@@ -473,6 +519,7 @@ class CollectorWorker(QtCore.QThread):
             "waves": {},
             "positive_trend_rows": [],
             "positive_wave_rows": [],
+            "record_time_unix": int(r_time),
         }
 
     def run(self):
@@ -480,6 +527,7 @@ class CollectorWorker(QtCore.QThread):
         output_file = ""
         output_fp = None
         logical_time_sec = 0.0
+        package_counter = 0
         try:
             output_file = pycollect.build_output_filename(self.output_name)
             output_fp = open(output_file, "wb")
@@ -499,7 +547,7 @@ class CollectorWorker(QtCore.QThread):
             self._send(ser, START_WAVES_HEX)
             self.status_signal.emit("Capture started")
 
-            for idx in range(self.duration_sec):
+            while package_counter < self.duration_sec:
                 if self._stop_requested:
                     self.status_signal.emit("Stop requested")
                     break
@@ -512,22 +560,29 @@ class CollectorWorker(QtCore.QThread):
 
                 processed = pycollect.process_received_data(incoming_data)
                 logical_time_sec += 1.0
+                package_counter += 1
                 if len(processed) > 40:
                     output_fp.write(processed)
                     output_fp.flush()
                     payload = self._extract_from_record(processed)
-                    payload["index"] = idx + 1
+                    payload["index"] = package_counter
                     payload["length"] = len(processed)
                     payload["time"] = logical_time_sec
                     self.package_signal.emit(payload)
                     self.status_signal.emit(
-                        f"Package {idx + 1}/{self.duration_sec}, "
+                        f"Package {package_counter}/{self.duration_sec}, "
                         f"{len(processed)} bytes"
                     )
                 else:
-                    self.status_signal.emit(f"Package {idx + 1} discarded")
+                    self.status_signal.emit(
+                        f"Package {package_counter} discarded"
+                    )
 
-                time.sleep(1)
+                # In simulation mode, don't throttle packets to 1 Hz.
+                # This allows replay speed multipliers (e.g., 10x) to be
+                # reflected in the GUI progression.
+                if not self.simulation_mode:
+                    time.sleep(1)
 
             self._send(ser, STOP_PARAM_HEX)
             self._send(ser, STOP_WAVES_HEX)
@@ -578,10 +633,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_last_received_at = {}
         self.wave_request_buttons = {}
         self.WAVE_REQUEST_TIMEOUT_SEC = 5.0
+        self.first_record_header_utc = None
+        self.last_record_header_utc = None
+        self.wave_last_seen_monotonic = {}
 
         self.worker = None
         self.logical_now_sec = 0.0
         self._in_splitter_adjust = False
+        self.graph_split_ratio = float(config.get("initial_split_ratio", 0.5))
 
         self.trend_buffers = {item["id"]: deque() for item in self.trend_defs}
         self.trend_history_by_row = {}
@@ -926,10 +985,42 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.graph_splitter.setStretchFactor(0, 1)
         self.graph_splitter.setStretchFactor(1, 1)
         self.graph_splitter.setSizes([500, 500])
+        self._apply_graph_split_ratio(self.graph_split_ratio)
 
-        layout.addWidget(self.graph_splitter, 1)
+        # Header above plots: most recent record time and recently active
+        # waveforms so clinicians can quickly confirm recency and channels.
+        self.graph_header = QtWidgets.QFrame()
+        self.graph_header.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        header_layout = QtWidgets.QHBoxLayout(self.graph_header)
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.setSpacing(12)
+
+        self.last_record_label = QtWidgets.QLabel(
+            "Last record (header UTC): --"
+        )
+        self.last_record_label.setStyleSheet("font-weight: 600;")
+        self.elapsed_label = QtWidgets.QLabel("Elapsed (header): --")
+        self.elapsed_label.setStyleSheet("font-weight: 600;")
+        self.recent_waves_label = QtWidgets.QLabel(
+            "Waveforms (last 5s): none"
+        )
+        self.recent_waves_label.setWordWrap(True)
+        self.recent_waves_label.setStyleSheet("color: #23364d;")
+        header_layout.addWidget(self.last_record_label, 0)
+        header_layout.addWidget(self.elapsed_label, 0)
+        header_layout.addWidget(self.recent_waves_label, 1)
+
+        self.graph_panel = QtWidgets.QWidget()
+        graph_panel_layout = QtWidgets.QVBoxLayout(self.graph_panel)
+        graph_panel_layout.setContentsMargins(0, 0, 0, 0)
+        graph_panel_layout.setSpacing(8)
+        graph_panel_layout.addWidget(self.graph_header)
+        graph_panel_layout.addWidget(self.graph_splitter, 1)
+
+        layout.addWidget(self.graph_panel, 1)
         self.refresh_slot_buttons()
         self._prepare_selector_popups()
+        self._update_graph_header()
 
     def _connect_signals(self):
         self.refresh_ports_btn.clicked.connect(self.refresh_ports)
@@ -1284,6 +1375,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         right_ratio = float(sizes[1]) / float(total)
         return left_ratio, right_ratio, total
 
+    def _apply_graph_split_ratio(self, ratio):
+        ratio = min(0.9, max(0.1, float(ratio)))
+        total = max(1, sum(self.graph_splitter.sizes()))
+        left_px = int(total * ratio)
+        right_px = total - left_px
+        self._in_splitter_adjust = True
+        self.graph_splitter.setSizes([left_px, right_px])
+        self._in_splitter_adjust = False
+
     def _effective_windows(self):
         trend_window = max(1.0, float(self.hr_window_spin.value()))
         wave_window = max(1.0, float(self.ecg_window_spin.value()))
@@ -1302,6 +1402,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.graph_splitter.setSizes([left_px, right_px])
             self._in_splitter_adjust = False
 
+        self.graph_split_ratio = clamped_ratio
+        self._save_runtime_config()
+
         self.update_plots()
 
     def start_capture(self):
@@ -1315,6 +1418,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
 
         self.logical_now_sec = 0.0
+        self.first_record_header_utc = None
+        self.last_record_header_utc = None
+        self.wave_last_seen_monotonic.clear()
         self.trend_history_by_row.clear()
         for values in self.trend_buffers.values():
             values.clear()
@@ -1333,8 +1439,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             trend_defs=self.trend_defs,
             wave_defs=self.wave_defs,
             output_name=self.output_name,
+            simulation_mode=self.simulation_mode,
         )
         self.worker.package_signal.connect(self.on_package)
+        self.worker.wave_mapping_signal.connect(self.on_wave_mapping)
         self.worker.status_signal.connect(self.log)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.error_signal.connect(self.on_error)
@@ -1352,6 +1460,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             f"Starting capture on {port}, duration={duration}s, "
             f"config={self.config['path']}, fs: {wave_fs_log}"
         )
+        self._update_graph_header()
         self.worker.start()
 
     def stop_capture(self):
@@ -1359,8 +1468,44 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.worker.request_stop()
             self.log("Stop requested")
 
+    def on_wave_mapping(self, wave_row_ids):
+        if not isinstance(wave_row_ids, (list, tuple)):
+            return
+        all_wave_by_row = {
+            int(item["row_identifier"]): item
+            for item in self.all_wave_defs
+        }
+        changed_slots = []
+        for idx, row_id in enumerate(wave_row_ids[: len(self.wave_defs)]):
+            row_id = int(row_id)
+            current_row = int(self.wave_defs[idx]["row_identifier"])
+            if row_id == current_row:
+                continue
+            new_item = all_wave_by_row.get(row_id)
+            if new_item is None:
+                continue
+            self._apply_slot_selection("wave", idx, new_item)
+            changed_slots.append(f"wave{idx + 1}->row{row_id}")
+        if changed_slots:
+            self.log(
+                "Auto-adapted wave slots from received records: "
+                + ", ".join(changed_slots)
+            )
+
     def on_package(self, payload):
         rel_t = float(payload.get("time", 0.0))
+        record_time_unix = payload.get("record_time_unix")
+        if record_time_unix is not None:
+            try:
+                record_dt = datetime.fromtimestamp(
+                    float(record_time_unix),
+                    tz=timezone.utc,
+                )
+                self.last_record_header_utc = record_dt
+                if self.first_record_header_utc is None:
+                    self.first_record_header_utc = record_dt
+            except Exception:
+                pass
 
         trend_rows = payload.get("trend_rows", {})
         waves = payload.get("waves", {})
@@ -1409,11 +1554,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self._sync_trend_slot_buffer(idx)
 
         max_wave_t = rel_t
+        now_mono = time.monotonic()
         for item in self.wave_defs:
             chan_id = item["id"]
             samples = waves.get(chan_id)
             if not samples:
                 continue
+            self.wave_last_seen_monotonic[chan_id] = now_mono
 
             sample_period = 1.0 / max(1.0, float(item["sample_hz"]))
             if self.wave_cursors[chan_id] is None:
@@ -1426,7 +1573,55 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 max_wave_t = max(max_wave_t, t_val)
 
         self.logical_now_sec = max(self.logical_now_sec, rel_t, max_wave_t)
+        self._update_graph_header()
         self.update_plots()
+
+    def _update_graph_header(self):
+        if self.last_record_header_utc is None:
+            self.last_record_label.setText("Last record (header UTC): --")
+        else:
+            self.last_record_label.setText(
+                "Last record (header UTC): "
+                f"{self.last_record_header_utc.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        if (
+            self.first_record_header_utc is None
+            or self.last_record_header_utc is None
+        ):
+            self.elapsed_label.setText("Elapsed (header): --")
+        else:
+            elapsed_sec = max(
+                0,
+                int(
+                    (
+                        self.last_record_header_utc
+                        - self.first_record_header_utc
+                    ).total_seconds()
+                ),
+            )
+            hh = elapsed_sec // 3600
+            mm = (elapsed_sec % 3600) // 60
+            ss = elapsed_sec % 60
+            self.elapsed_label.setText(
+                f"Elapsed (header): {hh:02d}:{mm:02d}:{ss:02d}"
+            )
+
+        now_mono = time.monotonic()
+        recent_wave_desc = []
+        for item in self.wave_defs:
+            chan_id = item["id"]
+            last_seen = self.wave_last_seen_monotonic.get(chan_id)
+            if last_seen is None:
+                continue
+            if (now_mono - last_seen) <= 5.0:
+                recent_wave_desc.append(item["title"])
+
+        if recent_wave_desc:
+            text = ", ".join(recent_wave_desc)
+        else:
+            text = "none"
+        self.recent_waves_label.setText(f"Waveforms (last 5s): {text}")
 
     @staticmethod
     def _build_wrapped_series(points, window_sec, now_sec, gap_sec=1.0):
@@ -1627,6 +1822,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         data["ui"]["duration_sec"] = int(self.duration_spin.value())
         data["ui"]["trend_window_sec"] = int(self.hr_window_spin.value())
         data["ui"]["wave_window_sec"] = float(self.ecg_window_spin.value())
+        data["ui"]["graph_split_ratio"] = float(self.graph_split_ratio)
         data["ui"]["simulator"]["speed_multiplier"] = float(
             self.sim_speed_spin.value()
         )

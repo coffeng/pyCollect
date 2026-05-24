@@ -5,11 +5,12 @@
   },
   "ui": {
     "duration_sec": 30,
-    "trend_window_sec": 45,
-    "wave_window_sec": 30.0,
+    "trend_window_sec": 360,
+    "wave_window_sec": 60.0,
     "simulator": {
-      "speed_multiplier": 2.0
-    }
+      "speed_multiplier": 20.0
+    },
+    "graph_split_ratio": 0.2823779193205945
   },
   "channels": {
     "trends": [
