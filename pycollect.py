@@ -445,6 +445,20 @@ def main():
             "and idle auto-close."
         ),
     )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=0,
+        help=(
+            "Auto-stop the Qt GUI capture after this many seconds. "
+            "0 disables (default)."
+        ),
+    )
+    parser.add_argument(
+        "--debug-stdout",
+        action="store_true",
+        help="Mirror Qt GUI log lines to stdout for debugging.",
+    )
 
     args = parser.parse_args()
 
@@ -460,6 +474,10 @@ def main():
             command.extend(["--output", args.output])
         if args.simulation_mode:
             command.append("--simulation-mode")
+        if args.duration and args.duration > 0:
+            command.extend(["--duration", str(args.duration)])
+        if args.debug_stdout:
+            command.append("--debug-stdout")
         subprocess.run(command, check=False)
         return
 

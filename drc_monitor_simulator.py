@@ -13,11 +13,13 @@ flag/checksum bytes similarly to the legacy pycollect logic.
 """
 
 import argparse
+import json
 import struct
 import time
 from pathlib import Path
 
 import serial
+from serial import SerialException
 
 
 FLAG = 0x7E
@@ -61,7 +63,28 @@ def parse_args() -> argparse.Namespace:
         "--interval",
         type=float,
         default=0.02,
-        help="Seconds between records (default: 0.02)",
+        help=(
+            "Fallback seconds between records when DRC timing cannot be "
+            "derived (default: 0.02)"
+        ),
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=None,
+        help=(
+            "Replay speed multiplier, e.g. 2.0 for 2x. "
+            "When omitted, speed is loaded from config and hot-reloaded."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default="pycollect_gui_config.json",
+        help=(
+            "Path to shared JSON config containing "
+            "ui.simulator.speed_multiplier "
+            "(default: pycollect_gui_config.json)"
+        ),
     )
     parser.add_argument(
         "--loop", action="store_true", help="Loop file replay forever"
@@ -120,8 +143,86 @@ def iter_drc_records(blob: bytes):
         if r_len < 40 or idx + r_len > total:
             break
         rec_no += 1
-        yield rec_no, blob[idx:idx + r_len]
+        record = blob[idx:idx + r_len]
+        # DRC record header stores unix time as uint32 at byte offset 6.
+        r_time = struct.unpack_from("<I", record, 6)[0]
+        yield rec_no, record, float(r_time)
         idx += r_len
+
+
+def _clamp_speed(value: float) -> float:
+    return max(0.05, min(20.0, float(value)))
+
+
+def _load_speed_from_config(
+    config_path: Path,
+    default_speed: float,
+) -> float:
+    if not config_path.exists():
+        return default_speed
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return default_speed
+    ui_cfg = raw.get("ui", {}) if isinstance(raw, dict) else {}
+    sim_cfg = ui_cfg.get("simulator", {}) if isinstance(ui_cfg, dict) else {}
+    value = sim_cfg.get("speed_multiplier", default_speed)
+    try:
+        return _clamp_speed(float(value))
+    except Exception:
+        return default_speed
+
+
+def _estimate_base_interval(records, fallback_interval: float) -> float:
+    if len(records) < 2:
+        return max(0.001, float(fallback_interval))
+    first_t = records[0][2]
+    last_t = records[-1][2]
+    span = max(0.0, last_t - first_t)
+    if span <= 0.0:
+        return max(0.001, float(fallback_interval))
+    return max(0.001, span / max(1, len(records) - 1))
+
+
+class SpeedController:
+    def __init__(self, config_path: Path, speed_override):
+        self.config_path = config_path
+        self.speed_override = speed_override
+        self.current_speed = (
+            _clamp_speed(speed_override)
+            if speed_override is not None
+            else _load_speed_from_config(config_path, 1.0)
+        )
+        self._last_mtime = None
+        if self.config_path.exists():
+            try:
+                self._last_mtime = self.config_path.stat().st_mtime
+            except OSError:
+                self._last_mtime = None
+
+    def current(self) -> float:
+        return self.current_speed
+
+    def refresh(self) -> bool:
+        if self.speed_override is not None:
+            return False
+        if not self.config_path.exists():
+            return False
+        try:
+            mtime = self.config_path.stat().st_mtime
+        except OSError:
+            return False
+        if self._last_mtime is not None and mtime <= self._last_mtime:
+            return False
+        self._last_mtime = mtime
+        new_speed = _load_speed_from_config(
+            self.config_path,
+            self.current_speed,
+        )
+        if abs(new_speed - self.current_speed) < 1e-6:
+            return False
+        self.current_speed = new_speed
+        return True
 
 
 def escape_payload(payload: bytes) -> bytes:
@@ -160,19 +261,44 @@ def wait_for_any_command(ser: serial.Serial):
 
 
 def replay_once(
-    ser: serial.Serial, records, interval: float, max_records: int
+    ser: serial.Serial,
+    records,
+    max_records: int,
+    speed_ctrl: "SpeedController",
+    fallback_interval: float,
 ):
     sent = 0
-    for rec_no, record in records:
+    base_interval = _estimate_base_interval(records, fallback_interval)
+    next_send_time = time.monotonic()
+    prev_time = None
+
+    for rec_no, record, rec_time in records:
+        if speed_ctrl.refresh():
+            print(
+                f"Speed updated from config: {speed_ctrl.current():.2f}x"
+            )
+
+        if prev_time is None:
+            wait_real = 0.0
+        else:
+            delta_src = rec_time - prev_time
+            if delta_src <= 0:
+                delta_src = base_interval
+            wait_real = delta_src / speed_ctrl.current()
+
+        next_send_time += wait_real
+        delay = next_send_time - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
         frame = frame_record(record)
         ser.write(frame)
         sent += 1
+        prev_time = rec_time
         if sent % 25 == 0:
             print(f"Sent {sent} records...")
         if max_records > 0 and sent >= max_records:
             break
-        if interval > 0:
-            time.sleep(interval)
     print(f"Replay complete: {sent} records sent.")
 
 
@@ -187,31 +313,54 @@ def main():
     if not records:
         raise RuntimeError("No valid DRC records found in input file.")
 
+    config_path = Path(args.config)
+    speed_ctrl = SpeedController(config_path, args.speed)
+
     use_rtscts = False if args.no_rtscts else bool(args.rtscts)
     print(f"Loaded {len(records)} records from {drc_path}")
     print(
         f"Opening {args.port} @ {args.baud}, "
         f"parity={args.parity}, rtscts={use_rtscts}"
     )
+    if args.speed is not None:
+        print(f"Replay speed: {speed_ctrl.current():.2f}x (CLI override)")
+    else:
+        print(
+            f"Replay speed: {speed_ctrl.current():.2f}x (from {config_path})"
+        )
 
-    with serial.Serial(
-        port=args.port,
-        baudrate=args.baud,
-        timeout=0.2,
-        bytesize=_bytesize(args.bytesize),
-        parity=_parity(args.parity),
-        stopbits=_stopbits(args.stopbits),
-        rtscts=use_rtscts,
-    ) as ser:
-        if args.wait_command:
-            wait_for_any_command(ser)
+    try:
+        with serial.Serial(
+            port=args.port,
+            baudrate=args.baud,
+            timeout=0.2,
+            bytesize=_bytesize(args.bytesize),
+            parity=_parity(args.parity),
+            stopbits=_stopbits(args.stopbits),
+            rtscts=use_rtscts,
+        ) as ser:
+            if args.wait_command:
+                wait_for_any_command(ser)
 
-        while True:
-            replay_once(ser, records, args.interval, args.max_records)
-            if not args.loop:
-                break
-            print("Loop enabled: restarting replay in 1 second...")
-            time.sleep(1)
+            while True:
+                replay_once(
+                    ser,
+                    records,
+                    args.max_records,
+                    speed_ctrl,
+                    args.interval,
+                )
+                if not args.loop:
+                    break
+                print("Loop enabled: restarting replay in 1 second...")
+                time.sleep(1)
+    except SerialException as exc:
+        print(f"ERROR: unable to open serial port {args.port}: {exc}")
+        print(
+            "Hint: another process is likely using this COM port. Stop "
+            "the other simulator/collector instance or choose another port."
+        )
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

@@ -231,11 +231,19 @@ Purpose:
 - Reads DRC records from file.
 - Wraps each record as serial frame with `0x7E` flags and escaped payload bytes.
 - Writes stream to a serial port to emulate a monitor.
+- Replays records using DRC record timestamps (normal speed), with optional
+  speed multiplier and runtime config hot reload.
 
 Example command:
 
 ```bash
 python drc_monitor_simulator.py --drc "C:\Users\100014430\Documents\GitLab\algorithms-tools\iCollect\Example.drc" --port COM2 --loop --wait-command --interval 0.02
+```
+
+Speed-aware example command:
+
+```bash
+python drc_monitor_simulator.py --drc "C:\Users\100014430\Documents\GitLab\algorithms-tools\iCollect\Example.drc" --port COM2 --loop --wait-command --config pycollect_gui_config.json
 ```
 
 ### 2) COM Bridge (Source -> Destination)
@@ -303,6 +311,16 @@ re-verified during future regression checks.
    Capture sections on autostart.
 14. Simulator-friendly mode auto-closes the GUI 10 seconds after the last
    received package.
+15. Simulator supports `--speed` multiplier override and `--config` hot reload
+  of `ui.simulator.speed_multiplier` from `pycollect_gui_config.json`.
+16. Simulator handles serial-open failures with a clear COM port conflict hint
+  instead of an unhandled traceback.
+17. CLI wrapper (`pycollect.py`) forwards `--duration` and `--debug-stdout`
+  to Qt GUI mode.
+18. Qt GUI supports a Waveform Request Catalog section with per-row request
+  toggles and state-driven button coloring (blue/green/yellow/red/default).
+19. Displayed wave rows are protected from being unrequested in the catalog.
+20. Qt GUI log can mirror to stdout when `--debug-stdout` is enabled.
 
 ### Enumerated Requirements For Future Verification
 
@@ -329,4 +347,19 @@ re-verified during future regression checks.
    10 seconds with no received package.
 12. Running simulator + collector on configured COM bridge pair must complete
    with clean process exit and produce a non-empty DRC file.
+13. `python drc_monitor_simulator.py --help` must list `--speed` and
+  `--config` options.
+14. With simulator `--config pycollect_gui_config.json` and loop mode,
+  changing `ui.simulator.speed_multiplier` at runtime must change replay
+  speed without restarting the simulator.
+15. In Qt GUI, catalog button state must follow:
+  blue=requested/no data yet,
+  green=requested+receiving,
+  red=requested+timed-out,
+  yellow=not requested but receiving,
+  default=not requested and stale/no data.
+16. Clicking a currently displayed wave row in catalog must keep it requested
+  and log a protection message.
+17. `python pycollect.py --help` and `python pycollect_qt_gui.py --help` must
+  show `--debug-stdout`; GUI log lines must be mirrored to stdout when used.
 

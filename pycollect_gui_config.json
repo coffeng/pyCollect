@@ -4,9 +4,12 @@
     "waves_file": "waves5.txt"
   },
   "ui": {
-    "duration_sec": 60,
-    "trend_window_sec": 30,
-    "wave_window_sec": 10.0
+    "duration_sec": 30,
+    "trend_window_sec": 45,
+    "wave_window_sec": 30.0,
+    "simulator": {
+      "speed_multiplier": 1.0
+    }
   },
   "channels": {
     "trends": [
@@ -14,13 +17,13 @@
         "row_identifier": 1
       },
       {
-        "row_identifier": 35
+        "row_identifier": 6
       },
       {
-        "row_identifier": 34
+        "row_identifier": 46
       },
       {
-        "row_identifier": 39
+        "row_identifier": 50
       }
     ],
     "waves": [

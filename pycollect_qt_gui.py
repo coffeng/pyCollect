@@ -549,6 +549,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         autostart=False,
         simulation_mode=False,
         initial_duration=None,
+        debug_stdout=False,
     ):
         super().__init__()
         self.setWindowTitle("pyCollect Interactive Viewer")
@@ -560,10 +561,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.output_name = output_name
         self.autostart = autostart
         self.simulation_mode = simulation_mode
+        self.debug_stdout = debug_stdout
+        self._is_closing = False
         self.trend_defs = config["trend_defs"]
         self.wave_defs = config["wave_defs"]
         self.positive_trend_rows = set()
         self.positive_wave_rows = set()
+
+        # Waveform request catalog state.
+        # wave_requested_rows: rows the user explicitly asked for.
+        # wave_last_received_at: monotonic time of last sample per row.
+        self.wave_requested_rows = set()
+        self.wave_last_received_at = {}
+        self.wave_request_buttons = {}
+        self.WAVE_REQUEST_TIMEOUT_SEC = 5.0
 
         self.worker = None
         self.logical_now_sec = 0.0
@@ -591,6 +602,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.sim_idle_timer.setInterval(10000)
         self.sim_idle_timer.timeout.connect(self._on_simulation_idle_timeout)
 
+        self.wave_request_state_timer = QtCore.QTimer(self)
+        self.wave_request_state_timer.setInterval(1000)
+        self.wave_request_state_timer.timeout.connect(
+            self._refresh_wave_request_button_states
+        )
+
         self._apply_pcs_theme()
         self._build_ui()
         self._connect_signals()
@@ -613,6 +630,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         if autostart and initial_port:
             QtCore.QTimer.singleShot(0, self.start_capture)
+
+        # Start the wave catalog color refresh loop now so colors update
+        # before, during, and after capture (1 Hz).
+        self.wave_request_state_timer.start()
+        # Seed: displayed rows are auto-requested at startup.
+        for row_id in self._displayed_wave_row_ids():
+            self.wave_requested_rows.add(int(row_id))
+        self._refresh_wave_request_button_states()
 
     def _apply_pcs_theme(self):
         self.setStyleSheet(
@@ -761,6 +786,48 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.status_box.setReadOnly(True)
         self.status_box.setMaximumBlockCount(500)
         status_section.content_layout.addWidget(self.status_box)
+
+        # Waveform Request Catalog: full list of available waveforms.
+        # Buttons are color-coded by state machine; see
+        # _wave_request_button_state() for transitions. Displayed rows are
+        # auto-requested and protected from being unrequested.
+        self.wave_catalog_section = CollapsibleSection(
+            "Waveform Request Catalog",
+            expanded=False,
+        )
+        left.insertWidget(
+            left.indexOf(view_section),
+            self.wave_catalog_section,
+        )
+        catalog_scroll = QtWidgets.QScrollArea()
+        catalog_scroll.setWidgetResizable(True)
+        catalog_scroll.setMinimumHeight(120)
+        catalog_scroll.setMaximumHeight(220)
+        catalog_inner = QtWidgets.QWidget()
+        catalog_grid = QtWidgets.QGridLayout(catalog_inner)
+        catalog_grid.setContentsMargins(0, 0, 0, 0)
+        catalog_grid.setHorizontalSpacing(4)
+        catalog_grid.setVerticalSpacing(4)
+
+        cols = 2
+        for idx, item in enumerate(self.all_wave_defs):
+            row_id = int(item["row_identifier"])
+            label = item.get("label") or item.get("title") or ""
+            btn = QtWidgets.QPushButton(f"#{row_id} {label}")
+            btn.setCheckable(True)
+            btn.setMinimumWidth(140)
+            btn.setProperty("row_id", row_id)
+            btn.toggled.connect(
+                lambda checked, rid=row_id: self._on_wave_request_clicked(
+                    rid,
+                    checked,
+                )
+            )
+            self.wave_request_buttons[row_id] = btn
+            catalog_grid.addWidget(btn, idx // cols, idx % cols)
+
+        catalog_scroll.setWidget(catalog_inner)
+        self.wave_catalog_section.content_layout.addWidget(catalog_scroll)
 
         left.addStretch(1)
         layout.addWidget(self.sidebar)
@@ -1141,7 +1208,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.status_box.appendPlainText(f"[{ts}] {msg}")
+        line = f"[{ts}] {msg}"
+        if self.debug_stdout:
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+        if self._is_closing:
+            return
+        try:
+            self.status_box.appendPlainText(line)
+        except RuntimeError:
+            pass
 
     def refresh_ports(self):
         current = self.port_combo.currentText()
@@ -1254,6 +1332,16 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         if self.simulation_mode:
             self.sim_idle_timer.start()
+
+        # Update wave request catalog: any row that produced positive samples
+        # is timestamped, and displayed rows are auto-requested.
+        now_mono = time.monotonic()
+        displayed_rows = self._displayed_wave_row_ids()
+        for row_id in positive_wave_rows:
+            self.wave_last_received_at[int(row_id)] = now_mono
+        for row_id in displayed_rows:
+            self.wave_requested_rows.add(int(row_id))
+        self._refresh_wave_request_button_states()
 
         trend_window, _wave_window = self._effective_windows()
         for row_key, val in trend_rows.items():
@@ -1398,6 +1486,81 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.worker.request_stop()
         QtCore.QTimer.singleShot(800, self.close)
 
+    # --- Waveform request catalog ----------------------------------------
+
+    def _displayed_wave_row_ids(self):
+        return {int(item["row_identifier"]) for item in self.wave_defs}
+
+    def _wave_request_button_state(self, row_id):
+        requested = row_id in self.wave_requested_rows
+        last_rx = self.wave_last_received_at.get(row_id)
+        if last_rx is None:
+            age = None
+        else:
+            age = time.monotonic() - last_rx
+        receiving = age is not None and age <= self.WAVE_REQUEST_TIMEOUT_SEC
+
+        if requested and receiving:
+            return "green"
+        if requested and last_rx is None:
+            return "blue"
+        if requested and not receiving:
+            return "red"
+        if not requested and receiving:
+            return "yellow"
+        return "default"
+
+    _WAVE_BTN_STYLES = {
+        "green": "background:#3ab36b;color:white;font-weight:600;",
+        "blue": "background:#2b83f6;color:white;font-weight:600;",
+        "yellow": "background:#f0c419;color:#222;font-weight:600;",
+        "red": "background:#d6352b;color:white;font-weight:600;",
+        "default": "",
+    }
+
+    def _apply_wave_request_button_style(self, row_id):
+        if self._is_closing:
+            return
+        btn = self.wave_request_buttons.get(row_id)
+        if btn is None:
+            return
+        try:
+            state = self._wave_request_button_state(row_id)
+            btn.setStyleSheet(self._WAVE_BTN_STYLES.get(state, ""))
+            btn.setProperty("color_state", state)
+            btn.blockSignals(True)
+            btn.setChecked(row_id in self.wave_requested_rows)
+            btn.blockSignals(False)
+        except RuntimeError:
+            pass
+
+    def _refresh_wave_request_button_states(self):
+        if self._is_closing:
+            return
+        for row_id in list(self.wave_request_buttons.keys()):
+            self._apply_wave_request_button_style(row_id)
+
+    def _on_wave_request_clicked(self, row_id, checked):
+        displayed = self._displayed_wave_row_ids()
+        if row_id in displayed and not checked:
+            # Protect currently displayed rows from being unrequested.
+            btn = self.wave_request_buttons.get(row_id)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(True)
+                btn.blockSignals(False)
+            self.log(
+                f"Wave row #{row_id} is displayed and stays requested"
+            )
+            return
+        if checked:
+            self.wave_requested_rows.add(int(row_id))
+            self.log(f"Requested wave row #{row_id}")
+        else:
+            self.wave_requested_rows.discard(int(row_id))
+            self.log(f"Cleared request for wave row #{row_id}")
+        self._apply_wave_request_button_style(row_id)
+
     def _save_runtime_config(self):
         cfg_path = Path(self.config.get("path", ""))
         if not cfg_path:
@@ -1432,7 +1595,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             encoding="utf-8",
         )
 
+    def _start_wave_request_state_timer(self):
+        if not self.wave_request_state_timer.isActive():
+            self.wave_request_state_timer.start()
+
     def closeEvent(self, event):
+        self._is_closing = True
+        try:
+            self.wave_request_state_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.sim_idle_timer.stop()
+        except Exception:
+            pass
         self._save_runtime_config()
         super().closeEvent(event)
 
@@ -1473,6 +1649,11 @@ def main():
             "auto-close after 10s of no packages."
         ),
     )
+    parser.add_argument(
+        "--debug-stdout",
+        action="store_true",
+        help="Mirror Qt GUI log lines to stdout for debugging.",
+    )
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
@@ -1499,6 +1680,7 @@ def main():
         autostart=bool(args.port.strip()),
         simulation_mode=args.simulation_mode,
         initial_duration=max(5, int(initial_duration)),
+        debug_stdout=args.debug_stdout,
     )
     win.show()
     win.raise_()
