@@ -1,0 +1,553 @@
+import argparse
+import collections
+import os
+import subprocess
+import struct
+import sys
+import time
+from datetime import datetime
+
+import serial  # pyserial is assumed to be available
+
+
+FLAG_CHAR = 0x7E
+ESCAPE_CHAR = 0x7D
+ESCAPE_MOD = 0x20
+DATA_INVALID = -32760
+DRI_MAX_SUBRECS = 8
+
+
+class LiveMonitorPlot:
+    """Simple live plot for first detected heart rate and ECG waveform."""
+
+    def __init__(
+        self,
+        hr_window_points=10,
+        ecg_window_samples=5000,
+        refresh_interval_sec=10,
+        keep_foreground=True,
+    ):
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            raise RuntimeError(
+                "GUI mode requires matplotlib. "
+                "Install it with: pip install matplotlib"
+            ) from exc
+
+        self.plt = plt
+        self.hr_points = collections.deque(maxlen=hr_window_points)
+        self.ecg_points = collections.deque(maxlen=ecg_window_samples)
+        self.refresh_interval_sec = max(1, int(refresh_interval_sec))
+        self.keep_foreground = keep_foreground
+        self.last_draw_time = 0.0
+
+        self.plt.ion()
+        self.fig, (self.ax_hr, self.ax_ecg) = self.plt.subplots(
+            2,
+            1,
+            figsize=(10, 6),
+        )
+        self.fig.suptitle("pycollect Live View")
+
+        self.hr_line, = self.ax_hr.plot([], [], "b-")
+        self.ax_hr.set_title("Heart Rate (first detected trend value)")
+        self.ax_hr.set_ylabel("bpm")
+        self.ax_hr.grid(True, alpha=0.3)
+        self.ax_hr.set_xlim(0, max(10, hr_window_points))
+        self.ax_hr.set_ylim(40, 140)
+
+        self.ecg_line, = self.ax_ecg.plot([], [], "r-")
+        self.ax_ecg.set_title("ECG Waveform (first detected wave channel)")
+        self.ax_ecg.set_ylabel("raw")
+        self.ax_ecg.set_xlabel("sample")
+        self.ax_ecg.grid(True, alpha=0.3)
+        self.ax_ecg.set_xlim(0, max(200, ecg_window_samples))
+        self.ax_ecg.set_ylim(-100, 100)
+
+        self.status_text = self.fig.text(
+            0.5,
+            0.01,
+            "Waiting for HR/ECG data...",
+            ha="center",
+            va="bottom",
+        )
+
+        self.fig.tight_layout()
+        self.fig.canvas.draw()
+        self._show_and_raise_window()
+        self._draw(force=True)
+
+    def _show_and_raise_window(self):
+        self.plt.show(block=False)
+        manager = self.fig.canvas.manager
+        window = getattr(manager, "window", None)
+
+        if window is None:
+            return
+
+        if not self.keep_foreground:
+            return
+
+        # Try Qt window controls first; fallback to Tk if available.
+        try:
+            if hasattr(window, "showNormal"):
+                window.showNormal()
+            if hasattr(window, "raise_"):
+                window.raise_()
+            if hasattr(window, "activateWindow"):
+                window.activateWindow()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(window, "attributes"):
+                window.attributes("-topmost", 1)
+                window.attributes("-topmost", 0)
+            if hasattr(window, "wm_attributes"):
+                window.wm_attributes("-topmost", 1)
+                window.wm_attributes("-topmost", 0)
+        except Exception:
+            pass
+
+    def _draw(self, force=False):
+        now = time.time()
+        if (
+            not force
+            and (now - self.last_draw_time) < self.refresh_interval_sec
+        ):
+            return
+        self.last_draw_time = now
+
+        hr_count = len(self.hr_points)
+        ecg_count = len(self.ecg_points)
+        self.status_text.set_text(
+            f"Last {hr_count} HR points, {ecg_count} ECG samples | "
+            f"refresh every {self.refresh_interval_sec}s"
+        )
+
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+        self.plt.pause(0.001)
+
+    def update(self, hr_value=None, ecg_samples=None):
+        if hr_value is not None:
+            self.hr_points.append(hr_value)
+
+        if ecg_samples:
+            self.ecg_points.extend(ecg_samples)
+
+        if self.hr_points:
+            y_hr = list(self.hr_points)
+            x_hr = list(range(len(y_hr)))
+            self.hr_line.set_data(x_hr, y_hr)
+            self.ax_hr.set_xlim(0, max(10, len(y_hr)))
+            hr_min = min(y_hr)
+            hr_max = max(y_hr)
+            if hr_min == hr_max:
+                hr_min -= 1
+                hr_max += 1
+            self.ax_hr.set_ylim(hr_min - 2, hr_max + 2)
+
+        if self.ecg_points:
+            y_ecg = list(self.ecg_points)
+            x_ecg = list(range(len(y_ecg)))
+            self.ecg_line.set_data(x_ecg, y_ecg)
+            self.ax_ecg.set_xlim(0, max(200, len(y_ecg)))
+            ecg_min = min(y_ecg)
+            ecg_max = max(y_ecg)
+            if ecg_min == ecg_max:
+                ecg_min -= 1
+                ecg_max += 1
+            margin = max(2, int((ecg_max - ecg_min) * 0.1))
+            self.ax_ecg.set_ylim(ecg_min - margin, ecg_max + margin)
+
+        self._draw(force=False)
+
+    def close(self):
+        self.plt.ioff()
+        self.plt.close(self.fig)
+
+
+def extract_first_hr_and_ecg(record_data):
+    """Extract first HR-like trend value and first ECG-like wave samples."""
+    if len(record_data) < 40:
+        return None, None
+
+    header_fmt = "< h b b H I b b H h " + "h b" * DRI_MAX_SUBRECS
+    header_struct = struct.Struct(header_fmt)
+
+    try:
+        header = header_struct.unpack(record_data[:40])
+    except struct.error:
+        return None, None
+
+    r_len = header[0]
+    r_maintype = header[8]
+    if r_len < 40 or r_len > len(record_data):
+        return None, None
+
+    sr_desc = header[9:]
+    raw_offsets = sr_desc[::2]
+    raw_types = sr_desc[1::2]
+    sr_types = [0 if t < -1 or t > 50 else t for t in raw_types]
+    payload = record_data[40:r_len]
+
+    first_hr = None
+    first_ecg = None
+
+    if r_maintype == 0:
+        for offset, sr_type in zip(raw_offsets, sr_types):
+            if sr_type <= 0:
+                continue
+
+            start = offset
+            end = start + 279
+            if start < 0 or end > len(payload):
+                continue
+
+            trend_subrecord = payload[start:end]
+            values_bytes = trend_subrecord[4:274]
+            if len(values_bytes) < 2:
+                continue
+
+            values = [
+                int.from_bytes(
+                    values_bytes[i:i + 2],
+                    byteorder="little",
+                    signed=True,
+                )
+                for i in range(0, len(values_bytes), 2)
+            ]
+            for value in values:
+                if value == DATA_INVALID:
+                    continue
+                if 20 <= value <= 250:
+                    first_hr = value
+                    break
+            if first_hr is not None:
+                break
+
+    elif r_maintype == 1:
+        valid_indices = [
+            index for index, item in enumerate(sr_types) if item > 0
+        ]
+        if valid_indices:
+            index = valid_indices[0]
+            start = raw_offsets[index] + 6
+            if index < len(valid_indices) - 1:
+                next_index = valid_indices[index + 1]
+                end = raw_offsets[next_index]
+            else:
+                end = len(payload)
+
+            if 0 <= start < end <= len(payload):
+                wave_bytes = payload[start:end]
+                if len(wave_bytes) >= 2:
+                    sample_count = len(wave_bytes) // 2
+                    unpack_fmt = "<" + "h" * sample_count
+                    first_ecg = list(
+                        struct.unpack(
+                            unpack_fmt,
+                            wave_bytes[:sample_count * 2],
+                        )
+                    )
+
+    return first_hr, first_ecg
+
+
+def process_received_data(data):
+    """Unescape bytes and strip frame flags/checksum from received data."""
+    processed_data = bytearray()
+
+    iterator = iter(data)
+    for byte in iterator:
+        if byte == ESCAPE_CHAR:
+            next_byte = next(iterator, None)
+            if next_byte is not None:
+                processed_data.append(next_byte ^ ESCAPE_MOD)
+        else:
+            processed_data.append(byte)
+
+    if len(processed_data) > 40:
+        if processed_data[0] == FLAG_CHAR:
+            processed_data = processed_data[1:]
+        if processed_data[-1] == FLAG_CHAR:
+            processed_data = processed_data[:-1]
+        processed_data = processed_data[:-1]
+
+    return processed_data
+
+
+def build_output_filename(output_name=None):
+    """Build output filename using default timestamp only when name omitted."""
+    timestamp = datetime.now().strftime("%y%m%d%H%M%S")
+    if not output_name:
+        return f"record_{timestamp}.drc"
+
+    cleaned = output_name.strip()
+    if not cleaned:
+        return f"record_{timestamp}.drc"
+
+    root, ext = os.path.splitext(cleaned)
+    if not ext:
+        return f"{cleaned}.drc"
+
+    return cleaned
+
+
+def send_hex_command(
+    port,
+    command_bytes,
+    operation_type,
+    interval,
+    count,
+    plotter=None,
+    output_name=None,
+):
+    """Send command and optionally capture/process response packages."""
+    ser = None
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=115200,
+            timeout=5,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_EVEN,
+            stopbits=serial.STOPBITS_ONE,
+            rtscts=True,
+        )
+
+        concatenated_data = bytearray()
+        if interval == 0:
+            interval = 10
+
+        ser.write(command_bytes)
+
+        if operation_type == "start":
+            for index in range(count):
+                incoming_data = ser.read_until(bytes([FLAG_CHAR]))
+
+                if len(incoming_data) < 40:
+                    incoming_data = ser.read_until(bytes([FLAG_CHAR]))
+
+                processed_data = process_received_data(incoming_data)
+
+                if len(processed_data) > 40:
+                    concatenated_data.extend(processed_data)
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"Package {index + 1} received at {now}, "
+                        f"length: {len(processed_data)} bytes"
+                    )
+
+                    if plotter is not None:
+                        hr_value, ecg_samples = extract_first_hr_and_ecg(
+                            processed_data
+                        )
+                        plotter.update(
+                            hr_value=hr_value,
+                            ecg_samples=ecg_samples,
+                        )
+                else:
+                    print(
+                        f"Package {index + 1} discarded "
+                        f"(length: {len(processed_data)} bytes)"
+                    )
+
+                time.sleep(interval)
+
+            filename = build_output_filename(output_name)
+            with open(filename, "wb") as file:
+                file.write(concatenated_data)
+
+            print(f"Data saved to {filename}")
+
+    except serial.SerialException as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+    finally:
+        if ser is not None and ser.is_open:
+            ser.close()
+
+
+def stripspaces(command):
+    """Remove spaces from a hex command string."""
+    return command.replace(" ", "")
+
+
+def main():
+    """Parse CLI arguments and run capture sequence."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Send hexadecimal commands to a serial port "
+            "and capture DRC data."
+        )
+    )
+    parser.add_argument(
+        "port",
+        nargs="?",
+        help="Serial port to use, for example COM2",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Send stop command only.",
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--gui",
+        action="store_true",
+        help="Enable live graph (heart rate + ECG waveform).",
+    )
+    mode_group.add_argument(
+        "--qt-gui",
+        action="store_true",
+        help="Launch interactive Qt GUI with left sidebar controls.",
+    )
+    mode_group.add_argument(
+        "--blind",
+        action="store_true",
+        help="Force blind collection mode (default behavior).",
+    )
+    parser.add_argument(
+        "--plot-window-sec",
+        type=int,
+        default=10,
+        help="Rolling display window in seconds for GUI mode.",
+    )
+    parser.add_argument(
+        "--plot-refresh-sec",
+        type=int,
+        default=10,
+        help="GUI refresh cadence in seconds.",
+    )
+    parser.add_argument(
+        "--ecg-samples-per-sec",
+        type=int,
+        default=500,
+        help="Approx ECG samples per second for GUI rolling window size.",
+    )
+    parser.add_argument(
+        "--output",
+        default="",
+        help=(
+            "Output filename, for example record.drc. "
+            "Default timestamped name is used only when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--simulation-mode",
+        action="store_true",
+        help=(
+            "Enable simulator-friendly Qt behavior such as section collapse "
+            "and idle auto-close."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.qt_gui:
+        gui_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "pycollect_qt_gui.py",
+        )
+        command = [sys.executable, gui_script]
+        if args.port:
+            command.extend(["--port", args.port])
+        if args.output:
+            command.extend(["--output", args.output])
+        if args.simulation_mode:
+            command.append("--simulation-mode")
+        subprocess.run(command, check=False)
+        return
+
+    if not args.port:
+        parser.error("port is required unless --qt-gui is used")
+
+    use_gui = args.gui and not args.blind
+    if use_gui:
+        hr_window_points = max(1, args.plot_window_sec)
+        ecg_window_samples = max(
+            100,
+            args.plot_window_sec * max(1, args.ecg_samples_per_sec),
+        )
+        refresh_every = max(1, args.plot_refresh_sec)
+        plotter = LiveMonitorPlot(
+            hr_window_points=hr_window_points,
+            ecg_window_samples=ecg_window_samples,
+            refresh_interval_sec=refresh_every,
+        )
+    else:
+        plotter = None
+
+    start_param_displ_command = stripspaces(
+        "7E31 0000 00E8 FD25 0407 6700 0000 0000 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0001 0A00 0800 0000 0000 BF7E"
+    )
+    stop_param_displ_command = stripspaces(
+        "7E31 0000 00E8 FD33 0607 6700 0000 0000 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0001 0000 0800 0000 0000 C57E"
+    )
+    start_waves_command = stripspaces(
+        "7E58 0000 00E8 FD58 2708 6700 0000 0001 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0000 0005 0001 0408 09FF 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 0045 7E"
+    )
+    stop_waves_command = stripspaces(
+        "7E58 0000 00E8 FD35 2808 6700 0000 0001 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0001 0005 0001 FF00 0000 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 000F 7E"
+    )
+
+    if not args.stop:
+        send_hex_command(
+            args.port,
+            bytes.fromhex(start_param_displ_command),
+            "start",
+            10,
+            6,
+            plotter=plotter,
+            output_name=args.output,
+        )
+        send_hex_command(
+            args.port,
+            bytes.fromhex(start_waves_command),
+            "start",
+            1,
+            60,
+            plotter=plotter,
+            output_name=args.output,
+        )
+
+    send_hex_command(
+        args.port,
+        bytes.fromhex(stop_param_displ_command),
+        "stop",
+        1,
+        1,
+    )
+    send_hex_command(
+        args.port,
+        bytes.fromhex(stop_waves_command),
+        "stop",
+        1,
+        1,
+    )
+
+    if plotter is not None:
+        try:
+            plotter.plt.show(block=True)
+        finally:
+            plotter.close()
+
+
+if __name__ == "__main__":
+    main()

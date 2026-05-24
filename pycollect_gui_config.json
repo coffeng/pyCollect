@@ -1,0 +1,25 @@
+{
+  "signal_sources": {
+    "params_file": "params5.txt",
+    "waves_file": "waves5.txt"
+  },
+  "ui": {
+    "duration_sec": 60,
+    "trend_window_sec": 60,
+    "wave_window_sec": 10
+  },
+  "channels": {
+    "trends": [
+      { "row_identifier": 1 },
+      { "row_identifier": 30 },
+      { "row_identifier": 46 },
+      { "row_identifier": 52 }
+    ],
+    "waves": [
+      { "row_identifier": 1 },
+      { "row_identifier": 8 },
+      { "row_identifier": 13 },
+      { "row_identifier": 14 }
+    ]
+  }
+}
