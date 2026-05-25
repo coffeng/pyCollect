@@ -241,8 +241,9 @@ def load_signal_config(base_dir, config_path=None):
 
 
 class CollapsibleSection(QtWidgets.QWidget):
-    def __init__(self, title, expanded=True, parent=None):
+    def __init__(self, title, expanded=True, parent=None, lockable=False, on_lock_callback=None):
         super().__init__(parent)
+        self.title = title
         self.toggle_btn = QtWidgets.QToolButton()
         self.toggle_btn.setText(title)
         self.toggle_btn.setCheckable(True)
@@ -253,6 +254,9 @@ class CollapsibleSection(QtWidgets.QWidget):
         )
 
         self.is_locked = False
+        self.lockable = lockable
+        self.on_lock_callback = on_lock_callback
+        
         self.content = QtWidgets.QWidget()
         self.content_layout = QtWidgets.QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(8, 6, 8, 6)
@@ -262,7 +266,24 @@ class CollapsibleSection(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self.toggle_btn)
+        
+        # Create header layout with toggle and optional lock button
+        header_layout = QtWidgets.QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
+        header_layout.addWidget(self.toggle_btn, 1)
+        
+        if lockable:
+            self.lock_btn = QtWidgets.QPushButton("🔓")
+            self.lock_btn.setMaximumWidth(40)
+            self.lock_btn.setFlat(True)
+            self.lock_btn.setStyleSheet("color: #2fa44f; font-size: 12px; padding: 2px;")
+            self.lock_btn.clicked.connect(self._toggle_lock)
+            header_layout.addWidget(self.lock_btn)
+        
+        header_widget = QtWidgets.QWidget()
+        header_widget.setLayout(header_layout)
+        root.addWidget(header_widget)
         root.addWidget(self.content)
 
         self.toggle_btn.toggled.connect(self._on_toggled)
@@ -272,9 +293,65 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.toggle_btn.setArrowType(
             QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
         )
+        self._update_lock_appearance()
+    
+    def _toggle_lock(self):
+        self.set_locked(not self.is_locked)
 
     def set_locked(self, locked):
         self.is_locked = locked
+        self._update_lock_appearance()
+        if self.on_lock_callback:
+            self.on_lock_callback(locked)
+    
+    def _update_lock_appearance(self):
+        """Update UI appearance based on lock state."""
+        if not self.lockable:
+            return
+        
+        # Update lock button appearance
+        if self.is_locked:
+            self.lock_btn.setText("🔒")
+            self.lock_btn.setStyleSheet("color: #ff4757; font-size: 12px; padding: 2px;")
+        else:
+            self.lock_btn.setText("🔓")
+            self.lock_btn.setStyleSheet("color: #2fa44f; font-size: 12px; padding: 2px;")
+        
+        # Update toggle button header background
+        if self.is_locked:
+            self.toggle_btn.setStyleSheet("color: #888888; background: #1a1a1a;")
+        else:
+            self.toggle_btn.setStyleSheet("")
+        
+        # Update content styling and control states
+        self._apply_content_lock_state()
+    
+    def _apply_content_lock_state(self):
+        """Apply lock/unlock styling to all child widgets."""
+        for widget in self._get_editable_widgets():
+            if self.is_locked:
+                # Gray out and disable
+                widget.setEnabled(False)
+                if isinstance(widget, QtWidgets.QLabel):
+                    widget.setStyleSheet("color: #888888;")
+                elif isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QSpinBox, QtWidgets.QComboBox)):
+                    widget.setStyleSheet("color: #888888; background: #1a1a1a;")
+            else:
+                # Restore normal appearance
+                widget.setEnabled(True)
+                if isinstance(widget, QtWidgets.QLabel):
+                    widget.setStyleSheet("")
+                elif isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QSpinBox, QtWidgets.QComboBox)):
+                    widget.setStyleSheet("")
+    
+    def _get_editable_widgets(self):
+        """Get all editable widgets in content area."""
+        widgets = []
+        for widget in self.content.findChildren(QtWidgets.QWidget):
+            if isinstance(widget, (QtWidgets.QLabel, QtWidgets.QLineEdit, QtWidgets.QSpinBox, 
+                                 QtWidgets.QComboBox, QtWidgets.QPushButton)):
+                widgets.append(widget)
+        return widgets
 
 class CollectorWorker(QtCore.QThread):
     package_signal = QtCore.pyqtSignal(object)
@@ -920,6 +997,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self._apply_pcs_theme()
         self._build_ui()
         self._connect_signals()
+        self._restore_section_locks()
         self.refresh_ports()
 
         if initial_duration is not None:
@@ -1334,6 +1412,42 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _on_section_lock_changed(self, section_name, locked):
+        """Handle section lock state change - persist to config."""
+        if self.config_path.exists():
+            try:
+                cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if "ui" not in cfg:
+                    cfg["ui"] = {}
+                if "section_locks" not in cfg["ui"]:
+                    cfg["ui"]["section_locks"] = {}
+                cfg["ui"]["section_locks"][section_name] = locked
+                self.config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+    def _restore_section_locks(self):
+        """Restore section lock states from config."""
+        try:
+            if not self.config_path.exists():
+                return
+            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+            locks = cfg.get("ui", {}).get("section_locks", {})
+            
+            # Map section names to CollapsibleSection objects
+            section_map = {
+                "monitor_connection": getattr(self, "conn_section", None),
+                "session_setup": getattr(self, "view_section", None),
+                "monitoring_control": getattr(self, "capture_section", None),
+            }
+            
+            for section_name, locked in locks.items():
+                section = section_map.get(section_name)
+                if section and hasattr(section, "set_locked"):
+                    section.set_locked(bool(locked))
+        except Exception:
+            pass
+
     def _build_ui(self):
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
@@ -1374,6 +1488,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.conn_section = CollapsibleSection(
             "Monitor Connection",
             expanded=True,
+            lockable=True,
+            on_lock_callback=lambda locked: self._on_section_lock_changed("monitor_connection", locked)
         )
         left.addWidget(self.conn_section)
         self.port_combo = QtWidgets.QComboBox()
@@ -1464,40 +1580,48 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         self._set_file_save_status("default", "")
 
-        view_section = CollapsibleSection("Session Setup", expanded=True)
-        left.addWidget(view_section)
+        view_section = CollapsibleSection(
+            "Session Setup", 
+            expanded=True,
+            lockable=True,
+            on_lock_callback=lambda locked: self._on_section_lock_changed("session_setup", locked)
+        )
+        self.view_section = view_section
+        left.addWidget(self.view_section)
 
         self.duration_spin = QtWidgets.QSpinBox()
         self.duration_spin.setRange(5, 3600)
         self.duration_spin.setValue(self.config["initial_duration"])
-        view_section.content_layout.addWidget(
+        self.view_section.content_layout.addWidget(
             QtWidgets.QLabel("Record Duration (sec)")
         )
-        view_section.content_layout.addWidget(self.duration_spin)
+        self.view_section.content_layout.addWidget(self.duration_spin)
 
         self.hr_window_spin = QtWidgets.QSpinBox()
         self.hr_window_spin.setRange(10, 3600)
         self.hr_window_spin.setValue(int(self.config["initial_trend_window"]))
-        view_section.content_layout.addWidget(
+        self.view_section.content_layout.addWidget(
             QtWidgets.QLabel("Vitals Window (sec)")
         )
-        view_section.content_layout.addWidget(self.hr_window_spin)
+        self.view_section.content_layout.addWidget(self.hr_window_spin)
 
         self.ecg_window_spin = QtWidgets.QDoubleSpinBox()
         self.ecg_window_spin.setRange(10.0, 300.0)
         self.ecg_window_spin.setSingleStep(0.5)
         self.ecg_window_spin.setValue(self.config["initial_wave_window"])
-        view_section.content_layout.addWidget(
+        self.view_section.content_layout.addWidget(
             QtWidgets.QLabel("Waveform Window (sec, 10..300)")
         )
-        view_section.content_layout.addWidget(self.ecg_window_spin)
-        view_section.content_layout.addWidget(
+        self.view_section.content_layout.addWidget(self.ecg_window_spin)
+        self.view_section.content_layout.addWidget(
             _hint("Next: select waveforms and start monitoring.")
         )
 
         self.capture_section = CollapsibleSection(
             "Monitoring Control",
             expanded=True,
+            lockable=True,
+            on_lock_callback=lambda locked: self._on_section_lock_changed("monitoring_control", locked)
         )
         left.addWidget(self.capture_section)
         self.start_btn = QtWidgets.QPushButton("Start Monitoring")

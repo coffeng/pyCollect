@@ -75,6 +75,11 @@
     "trend_window_sec": 300,
     "wave_window_sec": 20.0,
     "trend_interval_sec": 10,
+    "section_locks": {
+      "monitor_connection": false,
+      "session_setup": false,
+      "monitoring_control": false
+    },
     "connection": {
       "baudrate": 19200
     },
