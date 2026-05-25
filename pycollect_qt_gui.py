@@ -872,6 +872,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.first_record_header_utc = None
         self.last_record_header_utc = None
         self.wave_last_seen_monotonic = {}
+        self.wave_last_seen_by_row = {}  # Track all waveforms for header
         self.current_output_file = ""
         self.current_file_state = "default"
         self.csv_worker = None
@@ -886,6 +887,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.trend_history_by_row = {}
         self.wave_buffers = {item["id"]: deque() for item in self.wave_defs}
         self.wave_cursors = {item["id"]: None for item in self.wave_defs}
+        # Pre-populate wave_last_seen_by_row to include all waveforms
+        for item in self.all_wave_defs:
+            self.wave_last_seen_by_row[int(item["row_identifier"])] = None
 
         self.trend_plots = {}
         self.trend_curves = {}
@@ -2101,6 +2105,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.first_record_header_utc = None
         self.last_record_header_utc = None
         self.wave_last_seen_monotonic.clear()
+        self.wave_last_seen_by_row.clear()
         self.wave_user_unrequested_rows.clear()
         self.capture_started_monotonic = time.monotonic()
         self.trend_history_by_row.clear()
@@ -2262,7 +2267,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         now_mono = time.monotonic()
         displayed_rows = self._displayed_wave_row_ids()
         for row_id in positive_wave_rows:
-            self.wave_last_received_at[int(row_id)] = now_mono
+            row_id = int(row_id)
+            self.wave_last_received_at[row_id] = now_mono
+            self.wave_last_seen_by_row[row_id] = now_mono
         for row_id in displayed_rows:
             row = int(row_id)
             if row in self.wave_user_unrequested_rows:
@@ -2344,17 +2351,22 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             )
 
         now_mono = time.monotonic()
-        recent_wave_desc = []
-        for item in self.wave_defs:
-            chan_id = item["id"]
-            last_seen = self.wave_last_seen_monotonic.get(chan_id)
+        recent_wave_labels = []
+        row_to_label = {
+            int(item["row_identifier"]): item["label"]
+            for item in self.all_wave_defs
+        }
+        for row_id in sorted(self.wave_last_seen_by_row.keys()):
+            last_seen = self.wave_last_seen_by_row.get(row_id)
             if last_seen is None:
                 continue
             if (now_mono - last_seen) <= 5.0:
-                recent_wave_desc.append(item["title"])
+                label = row_to_label.get(row_id)
+                if label:
+                    recent_wave_labels.append(label)
 
-        if recent_wave_desc:
-            text = ", ".join(recent_wave_desc)
+        if recent_wave_labels:
+            text = ", ".join(recent_wave_labels)
         else:
             text = "none"
         self.recent_waves_label.setText(f"Waveforms (last 5s): {text}")
