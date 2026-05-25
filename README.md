@@ -726,3 +726,103 @@ re-verified during future regression checks.
 17. `python pycollect.py --help` and `python pycollect_qt_gui.py --help` must
   show `--debug-stdout`; GUI log lines must be mirrored to stdout when used.
 
+
+---
+
+## DOC2822852 Product Requirements Traceability
+
+The following table maps each requirement from `DOC2822852 iCollect Product Requirements Specification` to its current implementation status in this PyQt5 port.
+
+Legend:
+- ✅ Implemented (verified in this codebase)
+- 🟡 Partial (basic capability present; gaps noted)
+- ❌ Not implemented (missing in this codebase)
+- N/A Out of scope for this port
+
+### 5.1 Features and functions to fulfill Intended Use
+
+#### 5.1.1 Starting up Collect
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_UI_001 / URS_001 | Registration via password. | ❌ | No password / registration prompt in `pycollect_qt_gui.py`. The new **User Role** combo (Admin/Reviewer/Recorded) is a UX permission layer, not authenticated registration. |
+| PS_COLLECT_UI_002 | Restart reuses previous session config (paths, waveform & parameter selections) without explicit save. | ✅ | `pycollect_gui_config.json` is read at startup and written on close (`_save_runtime_config`); channel selections, baudrate, trend interval, section locks, and user role all persist. |
+| PS_COLLECT_UI_003 / URS_003 | Indicate "not intended for clinical use" (research only). | ❌ | No on-screen disclaimer banner / startup notice currently shown in the GUI. |
+
+#### 5.1.2 OnLine Mode
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_UI_004 / URS_004 | Collect selected trended parameters to binary DRC. | ✅ | `pycollect.py` writes DRC; trend rows configurable via `params5.txt` + JSON. |
+| PS_COLLECT_UI_005 | Collect selected waveforms displayed on monitor to binary DRC. | ✅ | Dynamic waveform request frame in `CollectorWorker._build_wave_request_frame` + simulator filtering verified. |
+| PS_COLLECT_UI_006 / URS_006 | Collect on-screen alarms to binary DRC. | ❌ | No alarm subrecord handling in the current collector (only trend + waveform subrecords processed). |
+| PS_COLLECT_UI_007 / URS_007 | All collected trends/waveforms/alarms selectable to visualize. | 🟡 | Trends and waveforms are selectable via the sidebar catalog and 4-slot graph display; alarms are not displayed. |
+| PS_COLLECT_UI_008 / URS_008 | Trend collection interval selectable from 5 sec to 1 hour. | 🟡 | New **Trend Interval** spinner in *Monitor Connection* covers 5–120 s in 5-s steps and persists to `ui.trend_interval_sec`. Upper bound 120 s instead of 3600 s — extend `setMaximum` to fully satisfy spec. |
+
+#### 5.1.3 Notes
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_UI_009 / URS_001(notes) | Annotations via a notes editor. | ❌ | No notes editor UI. |
+| PS_COLLECT_UI_010 | Notes stored to a file. | ❌ | No notes persistence. |
+
+#### 5.1.4 Snapshots
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_UI_011 / URS_011 | Latest displayed trends and waveforms viewable in a separate pop-up for detailed analysis during collection. | ❌ | No detached/zoom pop-up window implemented. Current viewer is single-window. |
+
+#### 5.1.5 Configuration
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_UI_012 | Configuration file determining collectable trends. | ✅ | `params5.txt` (tab-separated) + `channels.trends` in `pycollect_gui_config.json`. |
+| PS_COLLECT_UI_013 | Configuration file determining collectable waveforms. | ✅ | `waves5.txt` + `channels.waves` in `pycollect_gui_config.json`. |
+
+#### 5.1.6 OffLine Mode
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_UI_016 / URS_016 | Previously stored trends/waveforms/alarms in DRC selectable to visualize. | ❌ | No DRC playback/browser in the Qt GUI; only conversion to CSV. |
+| PS_COLLECT_UI_017 / URS_017 | DRC content savable to tab-limited ASCII files. | 🟡 | `drc_2_csv.py` produces comma-separated CSV (trends + waveforms). Tab-delimited output not directly produced — add a tab-export option. |
+| PS_COLLECT_UI_018 / URS_018 | Within a recorded file, select a subset of trends/waveforms for ASCII export. | ❌ | Conversion currently exports all channels; no per-channel subset selector in the export UI. |
+| PS_COLLECT_UI_019 / URS_019 | Within a recorded file, select a start/end time subset for ASCII export. | ❌ | No time-range subset selector for export. |
+
+#### 5.1.7 Labeling Requirements
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_MANUAL_001 / URS_M_001 | English electronic manual. | 🟡 | This `README.md` covers operation; no separate user manual document yet. |
+| PS_COLLECT_MANUAL_002 / URS_M_002 | Manual contains intended-use statement + non-clinical warning. | ❌ | Statement currently absent from `README.md`. |
+
+### 5.2–5.4 External / Hardware / Communication Interfaces
+
+| Req ID | Description | Status | Evidence / Notes |
+|---|---|---|---|
+| PS_COLLECT_EX_INTERFACE_001 | Support DRI serial computer interface protocol. | ✅ | `pycollect.py` implements DRI framing, escape handling, checksum. |
+| PS_COLLECT_EX_INTERFACE_004 | Support waveform & parameter data up to DRI_LEVEL_06. | 🟡 | Trend (DRI L01) + waveform subrecords handled; DRI level 06-specific subrecord coverage not exhaustively validated against the spec. |
+| PS_COLLECT_EX_INTERFACE_003 | Output file format: tab-limited ASCII tables. | 🟡 | CSV (comma) implemented; tab-delimited variant pending. |
+| PS_COLLECT_HW_INTERFACE_001 | PC with serial or USB port. | ✅ | Uses `pyserial`; works with any OS-enumerated COM port (incl. USB-serial). |
+| PS_COLLECT_HW_INTERFACE_003 | Windows 10 compatibility. | ✅ | Project runs on Windows 10/11 with Python 3 + PyQt5. |
+| PS_COLLECT_HW_INTERFACE_004 | Windows 11 compatibility. | ✅ | Same as above. |
+| PS_COLLECT_COMM_INTERFACE_003 | Support baud rates 19200 and 115200. | ✅ | Baudrate combo in *Monitor Connection* offers both; persisted to `ui.connection.baudrate`. |
+| PS_COLLECT_COMM_INTERFACE_004 | Compatibility with GEHC DRI-supporting Patient Monitors. | ✅ | Verified end-to-end against simulator; CARESCAPE COM5 path implemented. |
+
+### Summary
+
+| Status | Count |
+|---|---|
+| ✅ Implemented | 11 |
+| 🟡 Partial | 6 |
+| ❌ Missing | 9 |
+
+### Top Gaps to Close Next
+
+1. **Alarms** (PS_006 / URS_006, PS_007): add alarm subrecord parsing, storage, and display.
+2. **Notes editor + persistence** (PS_009, PS_010).
+3. **Offline DRC browser** (PS_016): in-GUI playback / review of stored DRC files.
+4. **ASCII export refinements** (PS_017, PS_018, PS_019): tab-delimited output, channel subset, time-range subset.
+5. **Intended-use disclaimer** (PS_003, PS_M_002): startup banner + manual statement.
+6. **Password registration** (PS_001): authenticated unlock for ASCII conversion (legacy LabVIEW behavior).
+7. **Snapshot pop-up window** (PS_011): detachable detailed-analysis window during live collection.
+8. **Trend interval upper bound**: raise `trend_interval_spin` maximum from 120 s to 3600 s to meet PS_008.
