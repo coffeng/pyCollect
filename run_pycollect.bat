@@ -48,10 +48,10 @@ echo   "%PY%" drc_2_csv.py "%ROOT%" "%ROOT%params5.txt" "%ROOT%waves5.txt"
 goto :eof
 
 :opt5
-echo [5] Qt GUI collector from real monitor (COM3)
+echo [5] Qt GUI collector from real monitor (COM5)
 echo Command:
-echo   "%PY%" pycollect.py --qt-gui COM3 --output record.drc
-"%PY%" pycollect.py --qt-gui COM3 --output record.drc
+echo   "%PY%" pycollect.py --qt-gui COM5 --output record.drc
+"%PY%" pycollect.py --qt-gui COM5 --output record.drc
 goto :eof
 
 :opt6
@@ -86,7 +86,7 @@ echo   3  Run simulator + Qt GUI together
 
 echo   4  Convert DRC files in this folder to CSV
 
-echo   5  Run Qt GUI collector from real monitor (COM3)
+echo   5  Run Qt GUI collector from real monitor (COM5)
 
 echo   6  Terminal-only mode: headless simulator, JSON waveforms, prints to terminal
 

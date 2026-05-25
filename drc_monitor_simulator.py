@@ -25,6 +25,12 @@ from serial import SerialException
 FLAG = 0x7E
 ESC = 0x7D
 ESC_XOR = 0x20
+DRI_MAX_SUBRECS = 8
+WAVE_MAINTYPE = 1
+EOL_SUBR_LIST = 0xFF
+
+HEADER_FMT = "< h b b H I b b H h " + "h b" * DRI_MAX_SUBRECS
+HEADER_STRUCT = struct.Struct(HEADER_FMT)
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,6 +251,221 @@ def frame_record(record: bytes) -> bytes:
     return bytes(framed)
 
 
+def _valid_wave_type(value: int) -> bool:
+    return 0 < int(value) <= 50
+
+
+def _decode_frame_body(body: bytes):
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        b = body[i]
+        if b == ESC and (i + 1) < len(body):
+            out.append(body[i + 1] ^ ESC_XOR)
+            i += 2
+            continue
+        out.append(b)
+        i += 1
+    return bytes(out)
+
+
+def _iter_frames_from_bytes(buffer: bytearray):
+    frames = []
+    while True:
+        try:
+            start = buffer.index(FLAG)
+        except ValueError:
+            buffer.clear()
+            break
+        if start > 0:
+            del buffer[:start]
+        try:
+            end = buffer.index(FLAG, 1)
+        except ValueError:
+            break
+        body = bytes(buffer[1:end])
+        del buffer[: end + 1]
+        decoded = _decode_frame_body(body)
+        if len(decoded) < 2:
+            continue
+        record = decoded[:-1]
+        checksum = decoded[-1]
+        if (sum(record) & 0xFF) != checksum:
+            continue
+        frames.append(record)
+    return frames
+
+
+class WaveRequestState:
+    def __init__(self):
+        self.active = True
+        self.selected_types = set()
+        self._rx_buffer = bytearray()
+
+    @staticmethod
+    def _wave_types_from_request(payload: bytes):
+        if len(payload) < 3:
+            return []
+        # Classic wf_req starts types at +2; extended requests at +4.
+        start_idx = 4 if len(payload) > 4 else 2
+        if start_idx >= len(payload):
+            start_idx = 2
+
+        values = []
+        for value in payload[start_idx:]:
+            if value == EOL_SUBR_LIST:
+                break
+            if _valid_wave_type(value):
+                values.append(int(value))
+        return values
+
+    def _apply_wave_request_record(self, record: bytes):
+        if len(record) < 40:
+            return
+        try:
+            header = HEADER_STRUCT.unpack(record[:40])
+        except Exception:
+            return
+
+        r_len = int(header[0])
+        r_maintype = int(header[8])
+        if r_maintype != WAVE_MAINTYPE:
+            return
+        if r_len < 40 or r_len > len(record):
+            return
+
+        payload = record[40:r_len]
+        if len(payload) < 1:
+            return
+        req_type = int(payload[0])
+
+        if req_type == 1:  # WF_REQ_CONT_STOP
+            self.active = False
+            self.selected_types = set()
+            return
+
+        wave_types = self._wave_types_from_request(payload)
+        self.active = True
+        self.selected_types = set(wave_types)
+
+    def process_incoming_bytes(self, data: bytes):
+        if not data:
+            return
+        self._rx_buffer.extend(data)
+        for record in _iter_frames_from_bytes(self._rx_buffer):
+            self._apply_wave_request_record(record)
+
+
+def _filter_wave_record(record: bytes, requested_types: set):
+    if len(record) < 40:
+        return record
+    try:
+        header = list(HEADER_STRUCT.unpack(record[:40]))
+    except Exception:
+        return record
+
+    r_len = int(header[0])
+    r_maintype = int(header[8])
+    if r_maintype != WAVE_MAINTYPE:
+        return record
+    if r_len < 40 or r_len > len(record):
+        return record
+
+    if not requested_types:
+        return None
+
+    payload = record[40:r_len]
+    sr_desc = header[9:]
+    raw_offsets = sr_desc[::2]
+    raw_types = sr_desc[1::2]
+
+    valid_indices = []
+    for idx, value in enumerate(raw_types):
+        wave_type = int(value)
+        if _valid_wave_type(wave_type):
+            valid_indices.append(idx)
+
+    if not valid_indices:
+        return None
+
+    selected_segments = []
+    selected_types = []
+    payload_len = len(payload)
+
+    for pos, idx in enumerate(valid_indices):
+        wave_type = int(raw_types[idx])
+        if wave_type not in requested_types:
+            continue
+        start = int(raw_offsets[idx])
+        if pos + 1 < len(valid_indices):
+            end = int(raw_offsets[valid_indices[pos + 1]])
+        else:
+            end = payload_len
+        start = max(0, min(start, payload_len))
+        end = max(start, min(end, payload_len))
+        segment = payload[start:end]
+        if not segment:
+            continue
+        selected_segments.append(segment)
+        selected_types.append(wave_type)
+
+    if not selected_segments:
+        return None
+
+    new_payload = b"".join(selected_segments)
+    new_r_len = 40 + len(new_payload)
+    header[0] = int(new_r_len)
+
+    sr_flat = []
+    running_offset = 0
+    for wave_type, segment in zip(selected_types, selected_segments):
+        sr_flat.extend([int(running_offset), int(wave_type)])
+        running_offset += len(segment)
+
+    sr_flat.extend([0, -1])
+    while len(sr_flat) < 16:
+        sr_flat.extend([0, 0])
+    sr_flat = sr_flat[:16]
+
+    for idx, value in enumerate(sr_flat):
+        header[9 + idx] = int(value)
+
+    try:
+        new_header = HEADER_STRUCT.pack(*header)
+    except Exception:
+        return record
+    return new_header + new_payload
+
+
+def apply_wave_request_filter(record: bytes, wave_state: "WaveRequestState"):
+    if wave_state is None:
+        return record
+    if not wave_state.active:
+        try:
+            header = HEADER_STRUCT.unpack(record[:40])
+            if int(header[8]) == WAVE_MAINTYPE:
+                return None
+        except Exception:
+            return record
+        return record
+    if not wave_state.selected_types:
+        return record
+    return _filter_wave_record(record, wave_state.selected_types)
+
+
+def poll_wave_requests(ser: serial.Serial, wave_state: "WaveRequestState"):
+    if wave_state is None:
+        return
+    while True:
+        try:
+            data = ser.read(256)
+        except Exception:
+            return
+        if not data:
+            break
+        wave_state.process_incoming_bytes(data)
+
+
 def wait_for_any_command(ser: serial.Serial):
     print("Waiting for incoming command bytes before starting replay...")
     buffer = bytearray()
@@ -266,6 +487,7 @@ def replay_once(
     max_records: int,
     speed_ctrl: "SpeedController",
     fallback_interval: float,
+    wave_state: "WaveRequestState",
 ):
     sent = 0
     base_interval = _estimate_base_interval(records, fallback_interval)
@@ -273,6 +495,8 @@ def replay_once(
     prev_time = None
 
     for rec_no, record, rec_time in records:
+        poll_wave_requests(ser, wave_state)
+
         if speed_ctrl.refresh():
             print(
                 f"Speed updated from config: {speed_ctrl.current():.2f}x"
@@ -291,7 +515,12 @@ def replay_once(
         if delay > 0:
             time.sleep(delay)
 
-        frame = frame_record(record)
+        filtered = apply_wave_request_filter(record, wave_state)
+        if filtered is None:
+            prev_time = rec_time
+            continue
+
+        frame = frame_record(filtered)
         ser.write(frame)
         sent += 1
         prev_time = rec_time
@@ -315,6 +544,7 @@ def main():
 
     config_path = Path(args.config)
     speed_ctrl = SpeedController(config_path, args.speed)
+    wave_state = WaveRequestState()
 
     use_rtscts = False if args.no_rtscts else bool(args.rtscts)
     print(f"Loaded {len(records)} records from {drc_path}")
@@ -341,6 +571,7 @@ def main():
         ) as ser:
             if args.wait_command:
                 wait_for_any_command(ser)
+                poll_wave_requests(ser, wave_state)
 
             while True:
                 replay_once(
@@ -349,6 +580,7 @@ def main():
                     args.max_records,
                     speed_ctrl,
                     args.interval,
+                    wave_state,
                 )
                 if not args.loop:
                     break

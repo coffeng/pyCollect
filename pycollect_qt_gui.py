@@ -3,6 +3,7 @@ import json
 import math
 import struct
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -211,9 +212,13 @@ def load_signal_config(base_dir, config_path=None):
         wave_defs.append(selected)
 
     ui_cfg = raw_cfg.get("ui", {})
+    conn_cfg = ui_cfg.get("connection", {})
     initial_duration = int(ui_cfg.get("duration_sec", 60))
     initial_trend_window = float(ui_cfg.get("trend_window_sec", 60))
     initial_wave_window = float(ui_cfg.get("wave_window_sec", 10))
+    initial_baudrate = int(conn_cfg.get("baudrate", 19200))
+    if initial_baudrate not in (19200, 115200):
+        initial_baudrate = 19200
     sim_cfg = ui_cfg.get("simulator", {})
     initial_sim_speed = float(sim_cfg.get("speed_multiplier", 1.0))
     initial_split_ratio = float(ui_cfg.get("graph_split_ratio", 0.5))
@@ -228,6 +233,7 @@ def load_signal_config(base_dir, config_path=None):
         "initial_duration": max(5, initial_duration),
         "initial_trend_window": max(10.0, initial_trend_window),
         "initial_wave_window": max(10.0, initial_wave_window),
+        "initial_baudrate": initial_baudrate,
         "initial_sim_speed": max(0.05, min(20.0, initial_sim_speed)),
         "initial_split_ratio": max(0.1, min(0.9, initial_split_ratio)),
         "colors": colors,
@@ -283,6 +289,7 @@ class CollectorWorker(QtCore.QThread):
         all_wave_defs,
         trend_defs,
         wave_defs,
+        baudrate=19200,
         output_name="",
         simulation_mode=False,
         parent=None,
@@ -294,6 +301,11 @@ class CollectorWorker(QtCore.QThread):
         self.all_wave_defs = all_wave_defs
         self.trend_defs = trend_defs
         self.wave_defs = wave_defs
+        self.baudrate = (
+            int(baudrate)
+            if int(baudrate) in (19200, 115200)
+            else 19200
+        )
         self.output_name = output_name
         self.simulation_mode = bool(simulation_mode)
         self._stop_requested = False
@@ -311,6 +323,13 @@ class CollectorWorker(QtCore.QThread):
             for item in wave_defs
             if int(item.get("sr_type", 0)) > 0
         ]
+        self._wave_req_lock = threading.Lock()
+        # _wave_req_rows will be synced from wave_requested_rows during capture
+        self._wave_req_rows = {
+            int(item["row_identifier"])
+            for item in wave_defs
+        }
+        self._wave_req_dirty = True
 
     def _rebuild_wave_type_map(self):
         self.selected_wave_types = {
@@ -343,7 +362,64 @@ class CollectorWorker(QtCore.QThread):
     def request_stop(self):
         self._stop_requested = True
 
+    def update_requested_wave_rows(self, row_ids):
+        normalized = {
+            int(row_id)
+            for row_id in (row_ids or [])
+            if int(row_id) > 0
+        }
+        with self._wave_req_lock:
+            if normalized == self._wave_req_rows:
+                return
+            self._wave_req_rows = set(normalized)
+            self._wave_req_dirty = True
+
+    def _consume_wave_request_rows(self, force=False):
+        with self._wave_req_lock:
+            if not force and not self._wave_req_dirty:
+                return None
+            self._wave_req_dirty = False
+            return sorted(self._wave_req_rows)
+
+    @staticmethod
+    def _build_wave_request_frame(selected_rows):
+        # Template matches the extended WF_REQ packet used by pyCollect.
+        template = bytearray(
+            bytes.fromhex(pycollect.stripspaces(START_WAVES_HEX))
+        )
+
+        req_count_idx = 43
+        req_types_start = 45
+        checksum_idx = len(template) - 2
+
+        wave_types = [
+            int(row_id) & 0xFF
+            for row_id in selected_rows
+            if int(row_id) > 0
+        ]
+        wave_types = sorted(set(wave_types))
+
+        max_types = max(0, (checksum_idx - req_types_start) - 1)
+        wave_types = wave_types[:max_types]
+
+        template[req_count_idx] = (len(wave_types) + 1) & 0xFF
+        for idx in range(req_types_start, checksum_idx):
+            template[idx] = 0x00
+
+        write_idx = req_types_start
+        for wave_type in wave_types:
+            template[write_idx] = int(wave_type) & 0xFF
+            write_idx += 1
+        template[write_idx] = 0xFF
+
+        checksum = sum(template[1:checksum_idx]) & 0xFF
+        template[checksum_idx] = checksum
+        return bytes(template)
+
     def _send(self, ser, hex_command):
+        if isinstance(hex_command, (bytes, bytearray)):
+            ser.write(bytes(hex_command))
+            return
         ser.write(bytes.fromhex(pycollect.stripspaces(hex_command)))
 
     def _extract_trends(self, payload):
@@ -564,7 +640,7 @@ class CollectorWorker(QtCore.QThread):
 
             ser = serial.Serial(
                 port=self.port,
-                baudrate=115200,
+                baudrate=self.baudrate,
                 timeout=5,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_EVEN,
@@ -572,15 +648,32 @@ class CollectorWorker(QtCore.QThread):
                 rtscts=True,
             )
 
-            self.status_signal.emit(f"Connected to {self.port}")
+            self.status_signal.emit(
+                f"Connected to {self.port} @ {self.baudrate}"
+            )
             self._send(ser, START_PARAM_HEX)
-            self._send(ser, START_WAVES_HEX)
+            initial_rows = self._consume_wave_request_rows(force=True) or []
+            self._send(
+                ser,
+                self._build_wave_request_frame(initial_rows),
+            )
             self.status_signal.emit("Capture started")
 
             while package_counter < self.duration_sec:
                 if self._stop_requested:
                     self.status_signal.emit("Stop requested")
                     break
+
+                pending_rows = self._consume_wave_request_rows(force=False)
+                if pending_rows is not None:
+                    self._send(
+                        ser,
+                        self._build_wave_request_frame(pending_rows),
+                    )
+                    self.status_signal.emit(
+                        "Wave request updated: "
+                        + ",".join(str(v) for v in pending_rows)
+                    )
 
                 incoming_data = ser.read_until(bytes([pycollect.FLAG_CHAR]))
                 if len(incoming_data) < 40:
@@ -767,10 +860,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # Waveform request catalog state.
         # wave_requested_rows: rows the user explicitly asked for.
         # wave_last_received_at: monotonic time of last sample per row.
+        # wave_slot_row_ids: maps slot index (0-3) to row_id displayed
         self.wave_requested_rows = set()
+        self.wave_user_unrequested_rows = set()
+        num_slots = len(self.wave_defs)
+        self.wave_slot_row_ids = [None] * num_slots  # Track row_id per slot
         self.wave_last_received_at = {}
         self.wave_request_buttons = {}
         self.WAVE_REQUEST_TIMEOUT_SEC = 5.0
+        self.capture_started_monotonic = None
         self.first_record_header_utc = None
         self.last_record_header_utc = None
         self.wave_last_seen_monotonic = {}
@@ -841,6 +939,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # Seed: displayed rows are auto-requested at startup.
         for row_id in self._displayed_wave_row_ids():
             self.wave_requested_rows.add(int(row_id))
+        # Initialize slot tracking: each slot displays its initial row_id.
+        for idx, item in enumerate(self.wave_defs):
+            self.wave_slot_row_ids[idx] = int(item.get("row_identifier", 0))
         self._refresh_wave_request_button_states()
 
     def _cfg_color(self, section, key, fallback):
@@ -887,13 +988,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         plot_bg = self._cfg_color("plot", "background", "#edf1f5")
         grid_color = self._cfg_color("plot", "grid", "#98a4b4")
         border_color = self._cfg_color("plot", "border", "#9aa5b3")
+        axis_text_color = self._cfg_color("text", "primary", "#ffffff")
         plot.setBackground(plot_bg)
         plot.showGrid(x=True, y=True, alpha=0.25)
         grid_pen = pg.mkPen(grid_color, width=1)
         plot.getAxis("left").setPen(grid_pen)
         plot.getAxis("bottom").setPen(grid_pen)
-        plot.getAxis("left").setTextPen(grid_pen)
-        plot.getAxis("bottom").setTextPen(grid_pen)
+        axis_text_pen = pg.mkPen(axis_text_color, width=1)
+        plot.getAxis("left").setTextPen(axis_text_pen)
+        plot.getAxis("bottom").setTextPen(axis_text_pen)
         plot.getViewBox().setBorder(pg.mkPen(border_color, width=1))
 
     def _wave_button_style_for_state(self, state):
@@ -1219,11 +1322,16 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
-        self.sidebar = QtWidgets.QFrame()
+        self.sidebar = QtWidgets.QScrollArea()
         self.sidebar.setMinimumWidth(330)
         self.sidebar.setMaximumWidth(380)
+        self.sidebar.setWidgetResizable(True)
+        self.sidebar.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.sidebar.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.sidebar.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        left = QtWidgets.QVBoxLayout(self.sidebar)
+
+        self.sidebar_content = QtWidgets.QWidget()
+        left = QtWidgets.QVBoxLayout(self.sidebar_content)
         left.setContentsMargins(10, 10, 10, 10)
         left.setSpacing(8)
 
@@ -1249,12 +1357,21 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         left.addWidget(self.conn_section)
         self.port_combo = QtWidgets.QComboBox()
+        self.baud_combo = QtWidgets.QComboBox()
+        self.baud_combo.addItems(["19200", "115200"])
+        self.baud_combo.setCurrentText(str(self.config["initial_baudrate"]))
         self.refresh_ports_btn = QtWidgets.QPushButton("Refresh Ports")
         self.conn_section.content_layout.addWidget(
             QtWidgets.QLabel("Source Port")
         )
-        self.conn_section.content_layout.addWidget(self.port_combo)
-        self.conn_section.content_layout.addWidget(self.refresh_ports_btn)
+        conn_row = QtWidgets.QHBoxLayout()
+        conn_row.setContentsMargins(0, 0, 0, 0)
+        conn_row.setSpacing(6)
+        conn_row.addWidget(self.port_combo, 1)
+        conn_row.addWidget(QtWidgets.QLabel("Baud"))
+        conn_row.addWidget(self.baud_combo)
+        conn_row.addWidget(self.refresh_ports_btn)
+        self.conn_section.content_layout.addLayout(conn_row)
         self.conn_section.content_layout.addWidget(
             _hint("Next: confirm monitor source and move to signal setup.")
         )
@@ -1465,6 +1582,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
 
         left.addStretch(1)
+        self.sidebar.setWidget(self.sidebar_content)
         layout.addWidget(self.sidebar)
 
         self.graph_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -1828,6 +1946,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             selected = dict(new_item)
             selected["id"] = slot_id
             self.wave_defs[slot_idx] = selected
+            row_id = int(new_item.get("row_identifier", 0))
+            self.wave_slot_row_ids[slot_idx] = row_id
             self.wave_buffers[slot_id].clear()
             self.wave_cursors[slot_id] = None
             plot = self.wave_plots[slot_id]
@@ -1981,6 +2101,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.first_record_header_utc = None
         self.last_record_header_utc = None
         self.wave_last_seen_monotonic.clear()
+        self.wave_user_unrequested_rows.clear()
+        self.capture_started_monotonic = time.monotonic()
         self.trend_history_by_row.clear()
         for values in self.trend_buffers.values():
             values.clear()
@@ -1991,6 +2113,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.update_plots(force=True)
 
         duration = self.duration_spin.value()
+        baudrate = int(self.baud_combo.currentText() or "19200")
         self.worker = CollectorWorker(
             port=port,
             duration_sec=duration,
@@ -1998,9 +2121,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             all_wave_defs=self.all_wave_defs,
             trend_defs=self.trend_defs,
             wave_defs=self.wave_defs,
+            baudrate=baudrate,
             output_name=self.output_name,
             simulation_mode=self.simulation_mode,
         )
+        self.worker.update_requested_wave_rows(self.wave_requested_rows)
         self.worker.package_signal.connect(self.on_package)
         self.worker.wave_mapping_signal.connect(self.on_wave_mapping)
         self.worker.status_signal.connect(self.log)
@@ -2018,7 +2143,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             ]
         )
         self.log(
-            f"Starting capture on {port}, duration={duration}s, "
+            f"Starting capture on {port}@{baudrate}, duration={duration}s, "
             f"config={self.config['path']}, fs: {wave_fs_log}"
         )
         self._update_graph_header()
@@ -2039,26 +2164,63 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.log("Stop requested")
 
     def on_wave_mapping(self, wave_row_ids):
+        """Handle available waveforms from record header.
+
+        Graphs display a subset of catalog-requested waveforms.
+        If a slot's waveform is no longer available, replace it with
+        another requested waveform not yet displayed.
+        """
         if not isinstance(wave_row_ids, (list, tuple)):
             return
+
+        available_wave_rows = {int(r) for r in wave_row_ids}
         all_wave_by_row = {
             int(item["row_identifier"]): item
             for item in self.all_wave_defs
         }
+
         changed_slots = []
-        for idx, row_id in enumerate(wave_row_ids[: len(self.wave_defs)]):
-            row_id = int(row_id)
-            current_row = int(self.wave_defs[idx]["row_identifier"])
-            if row_id == current_row:
+        currently_displayed = set()
+
+        # First pass: collect what's currently displayed
+        for idx in range(len(self.wave_defs)):
+            slot_row = self.wave_slot_row_ids[idx]
+            if slot_row is not None:
+                currently_displayed.add(slot_row)
+
+        # Second pass: replace slots with missing waveforms
+        for idx in range(len(self.wave_defs)):
+            slot_row = self.wave_slot_row_ids[idx]
+
+            # Skip if not assigned or still available
+            if slot_row is None or slot_row in available_wave_rows:
                 continue
-            new_item = all_wave_by_row.get(row_id)
+
+            # Find replacement from requested+available rows
+            replacement_row = None
+            for req_row in sorted(self.wave_requested_rows):
+                if req_row not in available_wave_rows:
+                    continue
+                if req_row in currently_displayed:
+                    continue
+                replacement_row = req_row
+                break
+
+            if replacement_row is None:
+                continue
+
+            new_item = all_wave_by_row.get(replacement_row)
             if new_item is None:
                 continue
+
             self._apply_slot_selection("wave", idx, new_item)
-            changed_slots.append(f"wave{idx + 1}->row{row_id}")
+            self.wave_slot_row_ids[idx] = replacement_row
+            currently_displayed.add(replacement_row)
+            changed_slots.append(f"wave{idx + 1}->row{replacement_row}")
+
         if changed_slots:
             self.log(
-                "Auto-adapted wave slots from received records: "
+                "Auto-replaced unavailable wave slots: "
                 + ", ".join(changed_slots)
             )
 
@@ -2102,7 +2264,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         for row_id in positive_wave_rows:
             self.wave_last_received_at[int(row_id)] = now_mono
         for row_id in displayed_rows:
-            self.wave_requested_rows.add(int(row_id))
+            row = int(row_id)
+            if row in self.wave_user_unrequested_rows:
+                continue
+            self.wave_requested_rows.add(row)
         self._refresh_wave_request_button_states()
 
         trend_window, _wave_window = self._effective_windows()
@@ -2280,12 +2445,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def on_finished(self, output_file):
         self.update_plots()
         self.sim_idle_timer.stop()
+        self.capture_started_monotonic = None
         self.log(f"Capture finished. Saved: {output_file}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
     def on_error(self, error_message):
         self.sim_idle_timer.stop()
+        self.capture_started_monotonic = None
         self.log(f"ERROR: {error_message}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -2298,6 +2465,16 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def _displayed_wave_row_ids(self):
         return {int(item["row_identifier"]) for item in self.wave_defs}
 
+    def _is_actively_appending(self):
+        if self.current_file_state != "blue":
+            return False
+        if self.worker is None:
+            return False
+        try:
+            return self.worker.isRunning()
+        except RuntimeError:
+            return False
+
     def _wave_request_button_state(self, row_id):
         requested = row_id in self.wave_requested_rows
         last_rx = self.wave_last_received_at.get(row_id)
@@ -2306,9 +2483,23 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         else:
             age = time.monotonic() - last_rx
         receiving = age is not None and age <= self.WAVE_REQUEST_TIMEOUT_SEC
+        appending = self._is_actively_appending()
+        missing_timeout = False
+        if (
+            requested
+            and last_rx is None
+            and appending
+            and self.capture_started_monotonic is not None
+        ):
+            missing_timeout = (
+                (time.monotonic() - self.capture_started_monotonic)
+                > self.WAVE_REQUEST_TIMEOUT_SEC
+            )
 
         if requested and receiving:
             return "green"
+        if requested and last_rx is None and missing_timeout:
+            return "red"
         if requested and last_rx is None:
             return "blue"
         if requested and not receiving:
@@ -2340,24 +2531,33 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self._apply_wave_request_button_style(row_id)
 
     def _on_wave_request_clicked(self, row_id, checked):
+        row_id = int(row_id)
         displayed = self._displayed_wave_row_ids()
-        if row_id in displayed and not checked:
-            # Protect currently displayed rows from being unrequested.
-            btn = self.wave_request_buttons.get(row_id)
-            if btn is not None:
-                btn.blockSignals(True)
-                btn.setChecked(True)
-                btn.blockSignals(False)
-            self.log(
-                f"Wave row #{row_id} is displayed and stays requested"
-            )
-            return
+        appending = self._is_actively_appending()
+        if row_id in displayed and not checked and appending:
+            state = self._wave_request_button_state(row_id)
+            if state != "red":
+                # Keep displayed rows selected while actively receiving.
+                btn = self.wave_request_buttons.get(row_id)
+                if btn is not None:
+                    btn.blockSignals(True)
+                    btn.setChecked(True)
+                    btn.blockSignals(False)
+                self.log(
+                    f"Wave row #{row_id} stays requested while active"
+                )
+                return
         if checked:
-            self.wave_requested_rows.add(int(row_id))
+            self.wave_requested_rows.add(row_id)
+            self.wave_user_unrequested_rows.discard(row_id)
             self.log(f"Requested wave row #{row_id}")
         else:
-            self.wave_requested_rows.discard(int(row_id))
+            self.wave_requested_rows.discard(row_id)
+            self.wave_user_unrequested_rows.add(row_id)
             self.log(f"Cleared request for wave row #{row_id}")
+
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.update_requested_wave_rows(self.wave_requested_rows)
         self._apply_wave_request_button_style(row_id)
 
     def _save_runtime_config(self):
@@ -2375,11 +2575,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         data.setdefault("signal_sources", {})
         data.setdefault("ui", {})
         data.setdefault("channels", {})
+        data["ui"].setdefault("connection", {})
         data["ui"].setdefault("simulator", {})
 
         data["ui"]["duration_sec"] = int(self.duration_spin.value())
         data["ui"]["trend_window_sec"] = int(self.hr_window_spin.value())
         data["ui"]["wave_window_sec"] = float(self.ecg_window_spin.value())
+        data["ui"]["connection"]["baudrate"] = int(
+            self.baud_combo.currentText() or "19200"
+        )
         data["ui"]["graph_split_ratio"] = float(self.graph_split_ratio)
         data["ui"]["simulator"]["speed_multiplier"] = float(
             self.sim_speed_spin.value()

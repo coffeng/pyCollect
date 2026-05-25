@@ -74,31 +74,98 @@ def test_catalog_visibility(win: gui.PyCollectQtWindow) -> None:
     QtWidgets.QApplication.processEvents()
 
 
-def test_displayed_rows_protected(win: gui.PyCollectQtWindow) -> None:
-    print("[2] Displayed rows are auto-requested and protected")
+def test_displayed_rows_selection_rules(win: gui.PyCollectQtWindow) -> None:
+    print("[2] Displayed rows follow active-appending selection rules")
     displayed = win._displayed_wave_row_ids()
     _expect(len(displayed) > 0, "have at least one displayed row")
+
+    # Rule A: when not actively appending, displayed rows can be toggled.
     for row_id in displayed:
         _expect(
             row_id in win.wave_requested_rows,
             f"displayed row #{row_id} auto-requested",
         )
         btn = win.wave_request_buttons[row_id]
-        # Try to uncheck via user-style toggle.
-        btn.click()  # simulated click
+        btn.click()  # simulated uncheck
+        QtWidgets.QApplication.processEvents()
+        _expect(
+            row_id not in win.wave_requested_rows,
+            f"displayed row #{row_id} can be unrequested when idle",
+        )
+        _expect(
+            not btn.isChecked(),
+            f"displayed row #{row_id} button can uncheck when idle",
+        )
+        btn.click()  # simulated re-check
         QtWidgets.QApplication.processEvents()
         _expect(
             row_id in win.wave_requested_rows,
-            f"displayed row #{row_id} stays requested after click",
+            f"displayed row #{row_id} can be re-requested when idle",
+        )
+
+    # Rule B: when actively appending and row is non-red, displayed rows
+    # are protected from unrequest.
+    row_id = sorted(displayed)[0]
+    btn = win.wave_request_buttons[row_id]
+    prev_worker = win.worker
+    prev_file_state = win.current_file_state
+    prev_capture_started = win.capture_started_monotonic
+
+    class _FakeWorker:
+        def isRunning(self):
+            return True
+
+        def update_requested_wave_rows(self, _rows):
+            return None
+
+    try:
+        win.current_file_state = "blue"
+        win.worker = _FakeWorker()
+        win.wave_requested_rows.add(row_id)
+        win.wave_last_received_at[row_id] = time.monotonic()
+
+        btn.click()  # attempt uncheck while green/active
+        QtWidgets.QApplication.processEvents()
+        _expect(
+            row_id in win.wave_requested_rows,
+            "displayed row stays requested while active and receiving",
         )
         _expect(
             btn.isChecked(),
-            f"displayed row #{row_id} button stays checked",
+            "displayed row button stays checked while active and receiving",
         )
+
+        # Rule C: during active appending, red/missing displayed rows can be
+        # unrequested.
+        win.capture_started_monotonic = (
+            time.monotonic() - (win.WAVE_REQUEST_TIMEOUT_SEC + 1.0)
+        )
+        win.wave_last_received_at.pop(row_id, None)
+        _expect(
+            win._wave_request_button_state(row_id) == "red",
+            "displayed row transitions to red when missing during active append",
+        )
+
+        btn.click()  # attempt uncheck while red/active
+        QtWidgets.QApplication.processEvents()
+        _expect(
+            row_id not in win.wave_requested_rows,
+            "displayed red row can be unrequested while active",
+        )
+    finally:
+        win.worker = prev_worker
+        win.current_file_state = prev_file_state
+        win.capture_started_monotonic = prev_capture_started
 
 
 def test_color_states(win: gui.PyCollectQtWindow) -> None:
     print("[3] Color state machine (blue/green/yellow/red/default)")
+    # Keep this test in idle mode so state colors map to pure request/receipt.
+    prev_worker = win.worker
+    prev_file_state = win.current_file_state
+    win.worker = None
+    win.current_file_state = "closed"
+
     # Pick a non-displayed row for safe toggling.
     displayed = win._displayed_wave_row_ids()
     candidates = [
@@ -106,6 +173,8 @@ def test_color_states(win: gui.PyCollectQtWindow) -> None:
     ]
     _expect(len(candidates) >= 1, "have a non-displayed row to test")
     if not candidates:
+        win.worker = prev_worker
+        win.current_file_state = prev_file_state
         return
     row_id = candidates[0]
 
@@ -162,6 +231,9 @@ def test_color_states(win: gui.PyCollectQtWindow) -> None:
         "default state (not requested, stale data)",
     )
 
+    win.worker = prev_worker
+    win.current_file_state = prev_file_state
+
 
 def test_persistence_of_requested(win: gui.PyCollectQtWindow) -> None:
     print("[4] _save_runtime_config does not crash with requested state")
@@ -194,7 +266,7 @@ def main() -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     win = _make_window()
     test_catalog_visibility(win)
-    test_displayed_rows_protected(win)
+    test_displayed_rows_selection_rules(win)
     test_color_states(win)
     test_persistence_of_requested(win)
     test_close_teardown(win)
