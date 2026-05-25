@@ -1198,19 +1198,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         pct = max(0, min(100, int(percent)))
         split = pct / 100.0
-
-        def _on_trend_interval_changed(self, value):
-            """Handle trend interval spinner change - save to config."""
-            # Save to config
-            if self.config_path.exists():
-                try:
-                    cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
-                    if "ui" not in cfg:
-                        cfg["ui"] = {}
-                    cfg["ui"]["trend_interval_sec"] = value
-                    self.config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
         done_bg = self._cfg_color("buttons", "active_bg", "#00d4ff")
         rest_bg = self._cfg_color("buttons", "normal_bg", "#1a3a52")
         txt = self._cfg_color("buttons", "normal_text", "#e8e8e8")
@@ -1333,6 +1320,19 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self._show_saved_csv_paths([])
         self.log(f"CSV conversion failed: {error_message}")
         self.csv_worker = None
+
+    def _on_trend_interval_changed(self, value):
+        """Handle trend interval spinner change - save to config."""
+        # Save to config
+        if self.config_path.exists():
+            try:
+                cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if "ui" not in cfg:
+                    cfg["ui"] = {}
+                cfg["ui"]["trend_interval_sec"] = value
+                self.config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     def _build_ui(self):
         root = QtWidgets.QWidget()

@@ -71,7 +71,7 @@
     }
   },
   "ui": {
-    "duration_sec": 3600,
+    "duration_sec": 30,
     "trend_window_sec": 300,
     "wave_window_sec": 20.0,
     "trend_interval_sec": 10,
