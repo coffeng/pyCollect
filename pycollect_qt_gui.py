@@ -252,6 +252,7 @@ class CollapsibleSection(QtWidgets.QWidget):
             QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow
         )
 
+        self.is_locked = False
         self.content = QtWidgets.QWidget()
         self.content_layout = QtWidgets.QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(8, 6, 8, 6)
@@ -272,6 +273,8 @@ class CollapsibleSection(QtWidgets.QWidget):
             QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
         )
 
+    def set_locked(self, locked):
+        self.is_locked = locked
 
 class CollectorWorker(QtCore.QThread):
     package_signal = QtCore.pyqtSignal(object)
@@ -1195,6 +1198,19 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         pct = max(0, min(100, int(percent)))
         split = pct / 100.0
+
+        def _on_trend_interval_changed(self, value):
+            """Handle trend interval spinner change - save to config."""
+            # Save to config
+            if self.config_path.exists():
+                try:
+                    cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+                    if "ui" not in cfg:
+                        cfg["ui"] = {}
+                    cfg["ui"]["trend_interval_sec"] = value
+                    self.config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
         done_bg = self._cfg_color("buttons", "active_bg", "#00d4ff")
         rest_bg = self._cfg_color("buttons", "normal_bg", "#1a3a52")
         txt = self._cfg_color("buttons", "normal_text", "#e8e8e8")
@@ -1376,6 +1392,23 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         conn_row.addWidget(self.baud_combo)
         conn_row.addWidget(self.refresh_ports_btn)
         self.conn_section.content_layout.addLayout(conn_row)
+        
+        # Trend interval selector
+        trend_interval_row = QtWidgets.QHBoxLayout()
+        trend_interval_row.setContentsMargins(0, 0, 0, 0)
+        trend_interval_row.setSpacing(6)
+        trend_interval_row.addWidget(QtWidgets.QLabel("Trend Interval"))
+        self.trend_interval_spin = QtWidgets.QSpinBox()
+        self.trend_interval_spin.setMinimum(5)
+        self.trend_interval_spin.setMaximum(120)
+        self.trend_interval_spin.setSingleStep(5)
+        self.trend_interval_spin.setValue(self.config.get("ui", {}).get("trend_interval_sec", 10))
+        self.trend_interval_spin.setSuffix(" sec")
+        self.trend_interval_spin.valueChanged.connect(self._on_trend_interval_changed)
+        trend_interval_row.addWidget(self.trend_interval_spin)
+        trend_interval_row.addStretch()
+        self.conn_section.content_layout.addLayout(trend_interval_row)
+        
         self.conn_section.content_layout.addWidget(
             _hint("Next: confirm monitor source and move to signal setup.")
         )
@@ -2270,6 +2303,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             row_id = int(row_id)
             self.wave_last_received_at[row_id] = now_mono
             self.wave_last_seen_by_row[row_id] = now_mono
+            # Also track waveforms that have actual data (fixes Flow waveform which has zero/negative values)
+            for item in self.wave_defs:
+                chan_id = item["id"]
+                if chan_id in waves and waves[chan_id]:
+                    row_id = int(item.get("row_identifier", 0))
+                    if row_id > 0:
+                        self.wave_last_seen_by_row[row_id] = now_mono
         for row_id in displayed_rows:
             row = int(row_id)
             if row in self.wave_user_unrequested_rows:

@@ -71,9 +71,10 @@
     }
   },
   "ui": {
-    "duration_sec": 30,
+    "duration_sec": 3600,
     "trend_window_sec": 300,
     "wave_window_sec": 20.0,
+    "trend_interval_sec": 10,
     "connection": {
       "baudrate": 19200
     },
@@ -88,7 +89,7 @@
         "row_identifier": 39
       },
       {
-        "row_identifier": 6
+        "row_identifier": 37
       },
       {
         "row_identifier": 46
@@ -102,10 +103,10 @@
         "row_identifier": 9
       },
       {
-        "row_identifier": 10
+        "row_identifier": 12
       },
       {
-        "row_identifier": 13
+        "row_identifier": 10
       },
       {
         "row_identifier": 14
