@@ -3,6 +3,7 @@
     "params_file": "params5.txt",
     "waves_file": "waves5.txt"
   },
+  "user_role": "Administrator",
   "colors": {
     "theme": "dark_medical",
     "sidebar": {

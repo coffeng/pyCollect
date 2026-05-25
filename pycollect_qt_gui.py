@@ -223,6 +223,9 @@ def load_signal_config(base_dir, config_path=None):
     initial_sim_speed = float(sim_cfg.get("speed_multiplier", 1.0))
     initial_split_ratio = float(ui_cfg.get("graph_split_ratio", 0.5))
     colors = raw_cfg.get("colors", {})
+    user_role = raw_cfg.get("user_role", "Administrator")
+    if user_role not in ("Administrator", "Reviewer", "Recorded"):
+        user_role = "Administrator"
 
     return {
         "path": str(cfg_path),
@@ -237,6 +240,7 @@ def load_signal_config(base_dir, config_path=None):
         "initial_sim_speed": max(0.05, min(20.0, initial_sim_speed)),
         "initial_split_ratio": max(0.1, min(0.9, initial_split_ratio)),
         "colors": colors,
+        "user_role": user_role,
     }
 
 
@@ -252,6 +256,11 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.toggle_btn.setArrowType(
             QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow
         )
+        # Left-align text/arrow so lock button on right doesn't push title to center.
+        self.toggle_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
+        self.toggle_btn.setStyleSheet("QToolButton { text-align: left; padding-left: 2px; }")
 
         self.is_locked = False
         self.lockable = lockable
@@ -308,23 +317,48 @@ class CollapsibleSection(QtWidgets.QWidget):
         """Update UI appearance based on lock state."""
         if not self.lockable:
             return
-        
-        # Update lock button appearance
-        if self.is_locked:
-            self.lock_btn.setText("🔒")
-            self.lock_btn.setStyleSheet("color: #ff4757; font-size: 12px; padding: 2px;")
-        else:
-            self.lock_btn.setText("🔓")
-            self.lock_btn.setStyleSheet("color: #2fa44f; font-size: 12px; padding: 2px;")
-        
+
+        # Preserve left-aligned style on toggle_btn regardless of lock state.
+        base_align = "QToolButton { text-align: left; padding-left: 2px;"
+        # Update lock button appearance (only re-style if it is still enabled).
+        if self.lock_btn.isEnabled():
+            if self.is_locked:
+                self.lock_btn.setText("🔒")
+                self.lock_btn.setStyleSheet(
+                    "color: #ff4757; font-size: 12px; padding: 2px;"
+                )
+            else:
+                self.lock_btn.setText("🔓")
+                self.lock_btn.setStyleSheet(
+                    "color: #2fa44f; font-size: 12px; padding: 2px;"
+                )
+
         # Update toggle button header background
         if self.is_locked:
-            self.toggle_btn.setStyleSheet("color: #888888; background: #1a1a1a;")
+            self.toggle_btn.setStyleSheet(
+                base_align + " color: #888888; background: #1a1a1a; }"
+            )
         else:
-            self.toggle_btn.setStyleSheet("")
-        
+            self.toggle_btn.setStyleSheet(base_align + " }")
+
         # Update content styling and control states
         self._apply_content_lock_state()
+
+    def set_lock_control_enabled(self, enabled):
+        """Enable/disable the lock toggle button itself (role-based).
+
+        When disabled, the lock icon is grayed and cannot be clicked, but
+        the current lock state (locked/unlocked) is preserved.
+        """
+        if not self.lockable:
+            return
+        self.lock_btn.setEnabled(bool(enabled))
+        if not enabled:
+            self.lock_btn.setStyleSheet(
+                "color: #555555; font-size: 12px; padding: 2px;"
+            )
+        else:
+            self._update_lock_appearance()
     
     def _apply_content_lock_state(self):
         """Apply lock/unlock styling to all child widgets."""
@@ -1448,6 +1482,68 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Apply current user role permissions to the lock controls.
+        self._apply_user_role_permissions()
+
+    # Sections whose locks should be forced/managed by role policy:
+    # monitor communication sections (Monitor Connection + Monitoring Control).
+    _MONITOR_COMM_SECTIONS = ("monitor_connection", "monitoring_control")
+
+    def _role_section_map(self):
+        return {
+            "monitor_connection": getattr(self, "conn_section", None),
+            "session_setup": getattr(self, "view_section", None),
+            "monitoring_control": getattr(self, "capture_section", None),
+        }
+
+    def _on_user_role_changed(self, role):
+        """Persist user role to config and re-apply role permissions."""
+        if self.config_path.exists():
+            try:
+                cfg = json.loads(
+                    self.config_path.read_text(encoding="utf-8")
+                )
+                cfg["user_role"] = role
+                self.config_path.write_text(
+                    json.dumps(cfg, indent=2), encoding="utf-8"
+                )
+            except Exception:
+                pass
+        self._apply_user_role_permissions()
+
+    def _apply_user_role_permissions(self):
+        """Enforce lock-edit permissions and forced locks based on role.
+
+        - Administrator: lock toggles editable; user controls lock state.
+        - Reviewer: monitor communication sections forced LOCKED,
+          and all lock toggles are read-only (greyed).
+        - Recorded: all lock toggles read-only (greyed); lock states preserved.
+        """
+        combo = getattr(self, "user_role_combo", None)
+        if combo is None:
+            return
+        role = combo.currentText()
+        sections = self._role_section_map()
+
+        if role == "Administrator":
+            for sec in sections.values():
+                if sec is not None:
+                    sec.set_lock_control_enabled(True)
+        elif role == "Reviewer":
+            # Force lock on monitor communication sections.
+            for name in self._MONITOR_COMM_SECTIONS:
+                sec = sections.get(name)
+                if sec is not None and not sec.is_locked:
+                    sec.set_locked(True)
+            # Disable lock controls for all sections in reviewer mode.
+            for sec in sections.values():
+                if sec is not None:
+                    sec.set_lock_control_enabled(False)
+        else:  # Recorded
+            for sec in sections.values():
+                if sec is not None:
+                    sec.set_lock_control_enabled(False)
+
     def _build_ui(self):
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
@@ -1728,6 +1824,29 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.advanced_section = CollapsibleSection("Advanced", expanded=False)
         left.addWidget(self.advanced_section)
+
+        # User role selector (controls who can change section locks)
+        self.advanced_section.content_layout.addWidget(
+            QtWidgets.QLabel("User Role")
+        )
+        self.user_role_combo = QtWidgets.QComboBox()
+        self.user_role_combo.addItems(["Administrator", "Reviewer", "Recorded"])
+        initial_role = self.config.get("user_role", "Administrator")
+        idx = self.user_role_combo.findText(initial_role)
+        if idx >= 0:
+            self.user_role_combo.setCurrentIndex(idx)
+        self.user_role_combo.currentTextChanged.connect(
+            self._on_user_role_changed
+        )
+        self.advanced_section.content_layout.addWidget(self.user_role_combo)
+        self.advanced_section.content_layout.addWidget(
+            _hint(
+                "Administrator: all locks editable. "
+                "Reviewer: monitor comm sections forced locked. "
+                "Recorded: locks read-only."
+            )
+        )
+
         self.sim_speed_spin = QtWidgets.QDoubleSpinBox()
         self.sim_speed_spin.setRange(0.05, 20.0)
         self.sim_speed_spin.setSingleStep(0.05)
