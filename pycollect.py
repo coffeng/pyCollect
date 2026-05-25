@@ -1,11 +1,13 @@
 import argparse
 import collections
+import json
 import os
 import subprocess
 import struct
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import serial  # pyserial is assumed to be available
 
@@ -376,6 +378,153 @@ def stripspaces(command):
     return command.replace(" ", "")
 
 
+def load_wave_config(base_dir=None, config_path=None):
+    """Load waveform definitions from JSON config file."""
+    if base_dir is None:
+        base_dir = Path.cwd()
+    else:
+        base_dir = Path(base_dir)
+
+    cfg_path = (
+        Path(config_path)
+        if config_path
+        else (base_dir / "pycollect_gui_config.json")
+    )
+
+    if not cfg_path.exists():
+        return None
+
+    try:
+        raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        wave_select = raw_cfg.get("channels", {}).get("waves", [])
+        if wave_select:
+            return wave_select
+    except Exception:
+        pass
+
+    return None
+
+
+def print_terminal_output(index, processed_data, wave_defs=None):
+    """Print formatted waveform data to terminal."""
+    hr_value, ecg_samples = extract_first_hr_and_ecg(processed_data)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    print(
+        f"\n[Package {index + 1}] {now} | Length: {len(processed_data)} bytes"
+    )
+
+    if hr_value is not None:
+        print(f"  Heart Rate (first): {hr_value} bpm")
+
+    if ecg_samples:
+        sample_count = len(ecg_samples)
+        min_sample = min(ecg_samples)
+        max_sample = max(ecg_samples)
+        avg_sample = sum(ecg_samples) / sample_count if sample_count else 0
+        print(
+            f"  Waveform (first): {sample_count} samples | "
+            f"min={min_sample}, max={max_sample}, avg={avg_sample:.1f}"
+        )
+        if sample_count <= 20:
+            print(f"    Samples: {ecg_samples}")
+        else:
+            print(f"    First 10: {ecg_samples[:10]}")
+            print(f"    Last 10:  {ecg_samples[-10:]}")
+
+
+def run_terminal_simulator(port, duration_sec, wave_defs=None, output_name=None):
+    """Run headless collection, print to terminal, and optionally save DRC file."""
+    print(f"Running for {duration_sec} seconds...\n")
+
+    start_param_command = stripspaces(
+        "7E31 0000 00E8 FD25 0407 6700 0000 0000 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0001 0A00 0800 0000 0000 BF7E"
+    )
+    start_waves_command = stripspaces(
+        "7E58 0000 00E8 FD58 2708 6700 0000 0001 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0000 0005 0001 0408 09FF 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 0045 7E"
+    )
+    stop_param_command = stripspaces(
+        "7E31 0000 00E8 FD33 0607 6700 0000 0000 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0001 0000 0800 0000 0000 C57E"
+    )
+    stop_waves_command = stripspaces(
+        "7E58 0000 00E8 FD35 2808 6700 0000 0001 0000 0000 "
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0001 0005 0001 FF00 0000 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 "
+        "0000 0000 0000 0000 0000 000F 7E"
+    )
+
+    ser = None
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=115200,
+            timeout=5,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_EVEN,
+            stopbits=serial.STOPBITS_ONE,
+            rtscts=True,
+        )
+
+        ser.write(bytes.fromhex(start_param_command))
+        ser.write(bytes.fromhex(start_waves_command))
+
+        start_time = time.time()
+        package_index = 0
+        concatenated_data = bytearray()
+
+        while time.time() - start_time < duration_sec:
+            try:
+                incoming_data = ser.read_until(bytes([FLAG_CHAR]))
+
+                if len(incoming_data) < 40:
+                    incoming_data = ser.read_until(bytes([FLAG_CHAR]))
+
+                processed_data = process_received_data(incoming_data)
+
+                if len(processed_data) > 40:
+                    concatenated_data.extend(processed_data)
+                    print_terminal_output(
+                        package_index,
+                        processed_data,
+                        wave_defs=wave_defs,
+                    )
+                    package_index += 1
+            except serial.SerialException:
+                break
+
+        elapsed = time.time() - start_time
+        print("\n" + "=" * 60)
+        print(f"Collection stopped after {elapsed:.1f}s")
+        print(f"Total packages received: {package_index}")
+        
+        if output_name and concatenated_data:
+            filename = build_output_filename(output_name)
+            with open(filename, "wb") as file:
+                file.write(concatenated_data)
+            print(f"Data saved to {filename} ({len(concatenated_data)} bytes)")
+        
+        print("=" * 60)
+
+        ser.write(bytes.fromhex(stop_param_command))
+        ser.write(bytes.fromhex(stop_waves_command))
+
+    except serial.SerialException as exc:
+        print(f"Serial error: {exc}")
+        sys.exit(1)
+    finally:
+        if ser is not None and ser.is_open:
+            ser.close()
+
+
 def main():
     """Parse CLI arguments and run capture sequence."""
     parser = argparse.ArgumentParser(
@@ -410,6 +559,14 @@ def main():
         "--blind",
         action="store_true",
         help="Force blind collection mode (default behavior).",
+    )
+    mode_group.add_argument(
+        "--terminal-simulator",
+        action="store_true",
+        help=(
+            "Headless mode for simulator: load waveforms from JSON config "
+            "and print to terminal."
+        ),
     )
     parser.add_argument(
         "--plot-window-sec",
@@ -459,6 +616,11 @@ def main():
         action="store_true",
         help="Mirror Qt GUI log lines to stdout for debugging.",
     )
+    parser.add_argument(
+        "--config",
+        default="pycollect_gui_config.json",
+        help="Path to JSON config file (for --terminal-simulator mode).",
+    )
 
     args = parser.parse_args()
 
@@ -481,8 +643,26 @@ def main():
         subprocess.run(command, check=False)
         return
 
+    if args.terminal_simulator:
+        if not args.port:
+            parser.error("port is required for --terminal-simulator mode")
+        wave_defs = load_wave_config(
+            base_dir=os.getcwd(),
+            config_path=args.config,
+        )
+        print(f"Terminal simulator mode on {args.port}")
+        if wave_defs:
+            print(f"Loaded {len(wave_defs)} waveform definitions from config")
+        run_terminal_simulator(
+            port=args.port,
+            duration_sec=args.duration if args.duration > 0 else 60,
+            wave_defs=wave_defs,
+            output_name=args.output,
+        )
+        return
+
     if not args.port:
-        parser.error("port is required unless --qt-gui is used")
+        parser.error("port is required unless --qt-gui or --terminal-simulator is used")
 
     use_gui = args.gui and not args.blind
     if use_gui:

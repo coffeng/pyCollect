@@ -75,7 +75,12 @@ class VariableLogger:
         self.file_handle.close()
 
 
-def extract_integers_post_header(all_data, logger=None):
+def extract_integers_post_header(
+    all_data,
+    logger=None,
+    progress_cb=None,
+    total_records=None,
+):
     trend_data = []
     wave_data = []
     times = []  # List to store converted times
@@ -122,7 +127,12 @@ def extract_integers_post_header(all_data, logger=None):
         raw_sr_type = [0 if t < -1 or t > 50 else t for t in sr_desc[1::2]]   # Set values not in range 0..5 to zero
         sr_offset = [0 if t == 0 else offset for offset, t in zip(raw_sr_offset, raw_sr_type)]  # Adjust sr_offset
         sr_cnt = sum(1 for tpe in raw_sr_type if tpe > 0)
-        cnt +=1
+        cnt += 1
+        if progress_cb and (cnt % 25 == 0):
+            try:
+                progress_cb(int(cnt), total_records)
+            except Exception:
+                pass
         record_len = r_len - 40
         if (cnt > SKIP_RECORDS):
             if r_maintype == 0: #trends
@@ -244,6 +254,11 @@ def extract_integers_post_header(all_data, logger=None):
                 previous_r_nbr = r_nbr
         remaining_bytes = r_len - 40
         data_pointer += remaining_bytes  # Adjust pointer to skip over remaining bytes
+    if progress_cb:
+        try:
+            progress_cb(int(cnt), total_records)
+        except Exception:
+            pass
     if logger:
         logger.log_variables({"LastTime": readable_time, "PackageCount": cnt })
     return trend_data, times, wave_data, first_wave_time_unix, pacer_info_list  # Return times, first_wave_time_unix, and pacer_info_list along with data
@@ -261,14 +276,28 @@ def read_waves_file(params_file_path):
     params_labels = ["Sel", "Freq","Delay","Divider","Filter","Column","Unit","Description"]
     return pd.read_csv(params_file_path, sep='\t', names=params_labels, header=None)
 
-def process_drc_file(data_file_path, params_df, waves_df, logger=None):
+def process_drc_file(
+    data_file_path,
+    params_df,
+    waves_df,
+    logger=None,
+    progress_cb=None,
+    total_records=None,
+):
     """
     Processes a single .drc file.
     """
     all_data = b''
     with open(data_file_path, 'rb') as file:
         all_data = file.read()
-    trend_records, times, wave_records, first_wave_time_unix, pacer_info_list = extract_integers_post_header(all_data, logger)
+    trend_records, times, wave_records, first_wave_time_unix, pacer_info_list = (
+        extract_integers_post_header(
+            all_data,
+            logger,
+            progress_cb=progress_cb,
+            total_records=total_records,
+        )
+    )
     trend_df = generate_dataframe(trend_records, times, params_df, logger)
     waves_df, freq = generate_waves_dataframe(wave_records, waves_df, first_wave_time_unix, logger)
     return trend_df, waves_df, freq, pacer_info_list

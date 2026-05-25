@@ -3,14 +3,81 @@
     "params_file": "params5.txt",
     "waves_file": "waves5.txt"
   },
+  "colors": {
+    "theme": "dark_medical",
+    "sidebar": {
+      "background": "#0d1f2d",
+      "text": "#e8e8e8",
+      "border": "#1a3a52"
+    },
+    "plot": {
+      "background": "#0a1428",
+      "grid": "#1a3a52",
+      "border": "#2a4a62"
+    },
+    "waveforms": {
+      "ecg": "#00d4ff",
+      "pressure": "#00e5ff",
+      "spo2": "#00d4ff",
+      "default": "#00d4ff"
+    },
+    "trends": {
+      "heart_rate": "#ff4757",
+      "systolic": "#ff6b6b",
+      "diastolic": "#ff8c8c",
+      "spo2": "#4ecdc4",
+      "default": "#ff4757"
+    },
+    "status": {
+      "active": "#00d4ff",
+      "warning": "#ffa502",
+      "alarm": "#ff4757",
+      "inactive": "#666666"
+    },
+    "text": {
+      "primary": "#ffffff",
+      "secondary": "#b0b0b0",
+      "accent": "#00d4ff",
+      "alarm": "#ff4757"
+    },
+    "buttons": {
+      "normal_bg": "#1a3a52",
+      "normal_text": "#e8e8e8",
+      "hover_bg": "#2a4a62",
+      "active_bg": "#00d4ff",
+      "active_text": "#0a1428"
+    },
+    "button_statuses": {
+      "green": {
+        "bg": "#2fa44f",
+        "text": "#ffffff"
+      },
+      "blue": {
+        "bg": "#00d4ff",
+        "text": "#0a1428"
+      },
+      "yellow": {
+        "bg": "#ffa502",
+        "text": "#1a1a1a"
+      },
+      "red": {
+        "bg": "#ff4757",
+        "text": "#ffffff"
+      },
+      "default": {
+        "bg": "#1a3a52",
+        "text": "#e8e8e8"
+      }
+    }
+  },
   "ui": {
-    "duration_sec": 30,
-    "trend_window_sec": 360,
-    "wave_window_sec": 60.0,
+    "duration_sec": 3600,
+    "trend_window_sec": 300,
+    "wave_window_sec": 20.0,
     "simulator": {
       "speed_multiplier": 20.0
     },
-    "graph_split_ratio": 0.2823779193205945
+    "graph_split_ratio": 0.3662420382165605
   },
   "channels": {
     "trends": [
@@ -24,7 +91,7 @@
         "row_identifier": 46
       },
       {
-        "row_identifier": 50
+        "row_identifier": 49
       }
     ],
     "waves": [

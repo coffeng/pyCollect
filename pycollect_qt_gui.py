@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import struct
 import sys
 import time
 from collections import deque
@@ -12,6 +13,7 @@ import serial
 from PyQt5 import QtCore, QtWidgets
 from serial.tools import list_ports
 
+import drc_2_csv
 import pycollect
 
 
@@ -74,6 +76,30 @@ def _display_name(label, unit):
     if clean_unit and clean_unit != "-":
         return f"{clean_label} [{clean_unit}]"
     return clean_label
+
+
+def _normalize_signal_key(text):
+    if not text:
+        return ""
+    normalized = []
+    for ch in str(text).lower():
+        if ch.isalnum():
+            normalized.append(ch)
+        else:
+            normalized.append("_")
+    key = "".join(normalized)
+    while "__" in key:
+        key = key.replace("__", "_")
+    return key.strip("_")
+
+
+def _compact_label_start(text, max_len=8):
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return "Wave"
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[:max_len]
 
 
 def load_signal_config(base_dir, config_path=None):
@@ -191,6 +217,7 @@ def load_signal_config(base_dir, config_path=None):
     sim_cfg = ui_cfg.get("simulator", {})
     initial_sim_speed = float(sim_cfg.get("speed_multiplier", 1.0))
     initial_split_ratio = float(ui_cfg.get("graph_split_ratio", 0.5))
+    colors = raw_cfg.get("colors", {})
 
     return {
         "path": str(cfg_path),
@@ -203,6 +230,7 @@ def load_signal_config(base_dir, config_path=None):
         "initial_wave_window": max(10.0, initial_wave_window),
         "initial_sim_speed": max(0.05, min(20.0, initial_sim_speed)),
         "initial_split_ratio": max(0.1, min(0.9, initial_split_ratio)),
+        "colors": colors,
     }
 
 
@@ -243,6 +271,7 @@ class CollectorWorker(QtCore.QThread):
     package_signal = QtCore.pyqtSignal(object)
     wave_mapping_signal = QtCore.pyqtSignal(object)
     status_signal = QtCore.pyqtSignal(str)
+    file_status_signal = QtCore.pyqtSignal(str, str)
     finished_signal = QtCore.pyqtSignal(str)
     error_signal = QtCore.pyqtSignal(str)
 
@@ -531,6 +560,7 @@ class CollectorWorker(QtCore.QThread):
         try:
             output_file = pycollect.build_output_filename(self.output_name)
             output_fp = open(output_file, "wb")
+            self.file_status_signal.emit("appending", output_file)
 
             ser = serial.Serial(
                 port=self.port,
@@ -594,8 +624,115 @@ class CollectorWorker(QtCore.QThread):
         finally:
             if output_fp is not None and not output_fp.closed:
                 output_fp.close()
+            if output_file:
+                self.file_status_signal.emit("closed", output_file)
             if ser is not None and ser.is_open:
                 ser.close()
+
+
+class CsvConversionWorker(QtCore.QThread):
+    progress_signal = QtCore.pyqtSignal(int, int, int)
+    finished_signal = QtCore.pyqtSignal(object)
+    error_signal = QtCore.pyqtSignal(str)
+
+    def __init__(self, drc_path, params_path, waves_path, parent=None):
+        super().__init__(parent)
+        self.drc_path = Path(drc_path)
+        self.params_path = Path(params_path)
+        self.waves_path = Path(waves_path)
+
+    def _count_records(self):
+        total = 0
+        with self.drc_path.open("rb") as fp:
+            while True:
+                header = fp.read(40)
+                if len(header) < 40:
+                    break
+                r_len = struct.unpack_from("<h", header, 0)[0]
+                if r_len < 40:
+                    break
+                total += 1
+                skip = r_len - 40
+                if skip > 0:
+                    fp.seek(skip, 1)
+        return max(0, int(total))
+
+    def run(self):
+        try:
+            total_records = self._count_records()
+            self.progress_signal.emit(1, 0, total_records)
+
+            params_df = drc_2_csv.read_params_file(str(self.params_path))
+            waves_df = drc_2_csv.read_waves_file(str(self.waves_path))
+
+            def on_progress(processed, _total):
+                total = (
+                    total_records
+                    if total_records > 0
+                    else int(_total or 0)
+                )
+                if total > 0:
+                    pct = int(
+                        min(
+                            90,
+                            max(1, (float(processed) * 90.0) / total),
+                        )
+                    )
+                else:
+                    pct = 45
+                self.progress_signal.emit(pct, int(processed), int(total))
+
+            trend_df, wave_df, freq, pacer_info_list = (
+                drc_2_csv.process_drc_file(
+                    str(self.drc_path),
+                    params_df,
+                    waves_df,
+                    logger=None,
+                    progress_cb=on_progress,
+                    total_records=(
+                        total_records if total_records > 0 else None
+                    ),
+                )
+            )
+
+            saved_paths = []
+            trend_csv_path = str(self.drc_path).replace(".drc", "_trends.csv")
+            drc_2_csv.save_dataframe_to_csv(
+                trend_df,
+                trend_csv_path,
+                logger=None,
+            )
+            saved_paths.append(trend_csv_path)
+            self.progress_signal.emit(95, total_records, total_records)
+
+            if freq > 0 and wave_df is not None:
+                wave_csv_path = str(self.drc_path).replace(
+                    ".drc",
+                    "_waves.csv",
+                )
+                drc_2_csv.save_dataframe_to_csv(
+                    wave_df,
+                    wave_csv_path,
+                    logger=None,
+                )
+                saved_paths.append(wave_csv_path)
+                self.progress_signal.emit(98, total_records, total_records)
+
+            if len(pacer_info_list) > 1:
+                drc_2_csv.save_pacers_to_csv(
+                    pacer_info_list,
+                    str(self.drc_path),
+                )
+                pacer_csv_path = str(self.drc_path).replace(
+                    ".drc",
+                    "_pacers.csv",
+                )
+                saved_paths.append(pacer_csv_path)
+
+            self.progress_signal.emit(100, total_records, total_records)
+            self.finished_signal.emit(saved_paths)
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
 
 
 class PyCollectQtWindow(QtWidgets.QMainWindow):
@@ -614,6 +751,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.resize(1300, 760)
 
         self.config = config
+        self.colors = config.get("colors", {})
         self.all_trend_defs = config["all_trend_defs"]
         self.all_wave_defs = config["all_wave_defs"]
         self.output_name = output_name
@@ -636,6 +774,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.first_record_header_utc = None
         self.last_record_header_utc = None
         self.wave_last_seen_monotonic = {}
+        self.current_output_file = ""
+        self.current_file_state = "default"
+        self.csv_worker = None
+        self.csv_convert_in_progress = False
 
         self.worker = None
         self.logical_now_sec = 0.0
@@ -701,50 +843,373 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.wave_requested_rows.add(int(row_id))
         self._refresh_wave_request_button_states()
 
+    def _cfg_color(self, section, key, fallback):
+        section_data = self.colors.get(section, {})
+        value = section_data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return fallback
+
+    def _resolve_signal_color(self, section, item, fallback):
+        palette = self.colors.get(section, {})
+        if not isinstance(palette, dict):
+            return fallback
+
+        aliases = {
+            "hr": "heart_rate",
+            "heartrate": "heart_rate",
+            "pr": "heart_rate",
+            "sys": "systolic",
+            "dia": "diastolic",
+        }
+
+        candidates = [
+            item.get("id", ""),
+            item.get("label", ""),
+            item.get("title", ""),
+        ]
+        for raw in candidates:
+            key = _normalize_signal_key(raw)
+            if not key:
+                continue
+            for lookup in (key, aliases.get(key, "")):
+                if lookup and lookup in palette:
+                    value = palette.get(lookup)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+
+        default_color = palette.get("default")
+        if isinstance(default_color, str) and default_color.strip():
+            return default_color.strip()
+        return fallback
+
+    def _style_plot_widget(self, plot):
+        plot_bg = self._cfg_color("plot", "background", "#edf1f5")
+        grid_color = self._cfg_color("plot", "grid", "#98a4b4")
+        border_color = self._cfg_color("plot", "border", "#9aa5b3")
+        plot.setBackground(plot_bg)
+        plot.showGrid(x=True, y=True, alpha=0.25)
+        grid_pen = pg.mkPen(grid_color, width=1)
+        plot.getAxis("left").setPen(grid_pen)
+        plot.getAxis("bottom").setPen(grid_pen)
+        plot.getAxis("left").setTextPen(grid_pen)
+        plot.getAxis("bottom").setTextPen(grid_pen)
+        plot.getViewBox().setBorder(pg.mkPen(border_color, width=1))
+
+    def _wave_button_style_for_state(self, state):
+        status = self.colors.get("status", {})
+        buttons = self.colors.get("buttons", {})
+        button_states = self.colors.get("button_statuses", {})
+        secondary_text = self._cfg_color("text", "secondary", "#222222")
+        normal_bg = buttons.get("normal_bg") or "transparent"
+        normal_text = buttons.get("normal_text") or secondary_text
+
+        # Prefer explicit per-state button colors from JSON when available.
+        state_cfg = button_states.get(state, {})
+        default_cfg = button_states.get("default", {})
+
+        def _pick_color(cfg, key):
+            value = cfg.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return None
+
+        if state == "green":
+            bg = (
+                _pick_color(state_cfg, "bg")
+                or status.get("active")
+                or "#3ab36b"
+            )
+            fg = _pick_color(state_cfg, "text") or "#ffffff"
+        elif state == "blue":
+            bg = (
+                _pick_color(state_cfg, "bg")
+                or buttons.get("active_bg")
+                or "#2b83f6"
+            )
+            fg = (
+                _pick_color(state_cfg, "text")
+                or buttons.get("active_text")
+                or "#ffffff"
+            )
+        elif state == "yellow":
+            bg = (
+                _pick_color(state_cfg, "bg")
+                or status.get("warning")
+                or "#f0c419"
+            )
+            fg = _pick_color(state_cfg, "text") or "#1a1a1a"
+        elif state == "red":
+            bg = (
+                _pick_color(state_cfg, "bg")
+                or status.get("alarm")
+                or "#d6352b"
+            )
+            fg = _pick_color(state_cfg, "text") or "#ffffff"
+        else:
+            bg = (
+                _pick_color(state_cfg, "bg")
+                or _pick_color(default_cfg, "bg")
+                or normal_bg
+            )
+            fg = (
+                _pick_color(state_cfg, "text")
+                or _pick_color(default_cfg, "text")
+                or normal_text
+            )
+        return f"background:{bg};color:{fg};font-weight:600;"
+
     def _apply_pcs_theme(self):
+        sidebar_bg = self._cfg_color("sidebar", "background", "#d6dde6")
+        sidebar_text = self._cfg_color("sidebar", "text", "#111111")
+        sidebar_border = self._cfg_color("sidebar", "border", "#b8c0cb")
+        primary_text = self._cfg_color("text", "primary", "#111111")
+        secondary_text = self._cfg_color("text", "secondary", "#3e4a5a")
+        buttons_normal_bg = self._cfg_color("buttons", "normal_bg", "#c7ced8")
+        buttons_normal_text = self._cfg_color(
+            "buttons",
+            "normal_text",
+            primary_text,
+        )
+        buttons_hover_bg = self._cfg_color("buttons", "hover_bg", "#bec7d2")
+        splitter_bg = self._cfg_color("plot", "grid", "#98a4b4")
+        inputs_bg = self._cfg_color("plot", "background", "#f1f4f7")
+
         self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background: #d6dde6;
-                color: #111111;
+            f"""
+            QMainWindow, QWidget {{
+                background: {sidebar_bg};
+                color: {primary_text};
                 font-size: 12px;
-            }
-            QFrame {
-                background: #d3dae3;
-                border: 1px solid #b8c0cb;
-            }
-            QLabel {
-                color: #111111;
-            }
-            QToolButton {
-                background: #c7ced8;
-                border: 1px solid #a9b2be;
+            }}
+            QFrame {{
+                background: {sidebar_bg};
+                border: 1px solid {sidebar_border};
+            }}
+            QLabel {{
+                color: {primary_text};
+            }}
+            QToolButton {{
+                background: {buttons_normal_bg};
+                color: {buttons_normal_text};
+                border: 1px solid {sidebar_border};
                 border-radius: 3px;
                 font-weight: 600;
                 padding: 6px;
                 text-align: left;
-            }
-            QToolButton:hover {
-                background: #bec7d2;
-            }
-            QComboBox, QSpinBox, QDoubleSpinBox, QPushButton {
-                background: #f1f4f7;
-                border: 1px solid #9aa5b3;
+            }}
+            QToolButton:hover {{
+                background: {buttons_hover_bg};
+            }}
+            QComboBox, QSpinBox, QDoubleSpinBox, QPushButton {{
+                background: {inputs_bg};
+                color: {sidebar_text};
+                border: 1px solid {sidebar_border};
                 border-radius: 3px;
                 padding: 4px;
-            }
-            QPlainTextEdit {
-                background: #eef2f6;
-                border: 1px solid #9aa5b3;
-            }
-            QSplitter::handle {
-                background: #98a4b4;
+            }}
+            QPlainTextEdit {{
+                background: {inputs_bg};
+                color: {secondary_text};
+                border: 1px solid {sidebar_border};
+            }}
+            QSplitter::handle {{
+                background: {splitter_bg};
                 width: 6px;
-            }
+            }}
             """
         )
-        pg.setConfigOption("background", "#edf1f5")
-        pg.setConfigOption("foreground", "#111111")
+        pg.setConfigOption(
+            "background",
+            self._cfg_color("plot", "background", "#edf1f5"),
+        )
+        pg.setConfigOption("foreground", primary_text)
+
+    def _save_state_colors(self, state):
+        button_states = self.colors.get("button_statuses", {})
+        buttons = self.colors.get("buttons", {})
+
+        state_cfg = button_states.get(state, {})
+        default_cfg = button_states.get("default", {})
+
+        def _pick(cfg, key):
+            value = cfg.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return None
+
+        bg = (
+            _pick(state_cfg, "bg")
+            or _pick(default_cfg, "bg")
+            or buttons.get("normal_bg")
+            or "#1f2d3d"
+        )
+        fg = (
+            _pick(state_cfg, "text")
+            or _pick(default_cfg, "text")
+            or buttons.get("normal_text")
+            or "#ffffff"
+        )
+        return bg, fg
+
+    def _set_file_save_status(self, state, file_path=""):
+        self.current_file_state = state
+        self.current_output_file = str(file_path or "").strip()
+        text = "No output file"
+        if self.current_output_file:
+            text = Path(self.current_output_file).name
+
+        bg, fg = self._save_state_colors(state)
+        self.save_file_name_label.setText(text)
+        self.save_file_name_label.setToolTip(self.current_output_file)
+        self.save_file_name_label.setStyleSheet(
+            "padding:6px;border-radius:4px;"
+            f"background:{bg};color:{fg};font-weight:600;"
+        )
+
+        can_convert = (
+            state == "green"
+            and bool(self.current_output_file)
+            and Path(self.current_output_file).exists()
+            and not self.csv_convert_in_progress
+        )
+        self.convert_csv_btn.setVisible(
+            state == "green" or self.csv_convert_in_progress
+        )
+        self.convert_csv_btn.setEnabled(can_convert)
+        if not self.csv_convert_in_progress:
+            self._set_convert_button_progress(None)
+
+    def _set_convert_button_progress(self, percent):
+        if percent is None:
+            self.convert_csv_btn.setText("Convert Current DRC to CSV")
+            self.convert_csv_btn.setStyleSheet("")
+            return
+
+        pct = max(0, min(100, int(percent)))
+        split = pct / 100.0
+        done_bg = self._cfg_color("buttons", "active_bg", "#00d4ff")
+        rest_bg = self._cfg_color("buttons", "normal_bg", "#1a3a52")
+        txt = self._cfg_color("buttons", "normal_text", "#e8e8e8")
+
+        self.convert_csv_btn.setText(f"Converting... {pct}%")
+        self.convert_csv_btn.setStyleSheet(
+            "QPushButton {"
+            "font-weight: 600;"
+            f"color: {txt};"
+            "border-radius: 3px;"
+            "padding: 4px;"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            f"stop:0 {done_bg},"
+            f"stop:{split:.4f} {done_bg},"
+            f"stop:{split:.4f} {rest_bg},"
+            f"stop:1 {rest_bg});"
+            "}"
+        )
+
+    def _show_saved_csv_paths(self, saved_paths):
+        self.convert_saved_list.clear()
+        if not saved_paths:
+            self.convert_saved_header.setVisible(False)
+            self.convert_saved_list.setVisible(False)
+            return
+
+        for path_text in saved_paths:
+            item = QtWidgets.QListWidgetItem(str(path_text))
+            item.setTextAlignment(
+                QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
+            )
+            item.setToolTip(str(path_text))
+            self.convert_saved_list.addItem(item)
+
+        self.convert_saved_header.setVisible(True)
+        self.convert_saved_list.setVisible(True)
+
+    def _signal_source_paths(self):
+        config_path = Path(self.config.get("path", ""))
+        base_dir = Path(__file__).resolve().parent
+        params_path = base_dir / "params5.txt"
+        waves_path = base_dir / "waves5.txt"
+
+        if config_path.exists():
+            try:
+                raw_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                src = raw_cfg.get("signal_sources", {})
+                params_rel = src.get("params_file")
+                waves_rel = src.get("waves_file")
+                if params_rel:
+                    params_path = (base_dir / str(params_rel)).resolve()
+                if waves_rel:
+                    waves_path = (base_dir / str(waves_rel)).resolve()
+            except Exception:
+                pass
+        return params_path, waves_path
+
+    def convert_current_drc_to_csv(self):
+        if self.csv_convert_in_progress:
+            return
+        if not self.current_output_file:
+            self.log("No DRC file available for conversion")
+            return
+
+        drc_path = Path(self.current_output_file)
+        if not drc_path.exists():
+            self.log(f"DRC file not found: {drc_path}")
+            return
+
+        params_path, waves_path = self._signal_source_paths()
+        if not params_path.exists() or not waves_path.exists():
+            self.log(
+                "Missing params/waves config files required for CSV conversion"
+            )
+            return
+
+        self.csv_convert_in_progress = True
+        self.convert_csv_btn.setEnabled(False)
+        self._set_convert_button_progress(0)
+        self._show_saved_csv_paths([])
+        self.log(f"Converting to CSV: {drc_path.name}")
+
+        self.csv_worker = CsvConversionWorker(
+            drc_path=drc_path,
+            params_path=params_path,
+            waves_path=waves_path,
+            parent=self,
+        )
+        self.csv_worker.progress_signal.connect(self.on_csv_progress)
+        self.csv_worker.finished_signal.connect(self.on_csv_finished)
+        self.csv_worker.error_signal.connect(self.on_csv_error)
+        self.csv_worker.start()
+
+    def on_csv_progress(self, percent, processed, total):
+        self._set_convert_button_progress(percent)
+        if total > 0:
+            self.convert_csv_btn.setToolTip(f"{processed}/{total} records")
+        else:
+            self.convert_csv_btn.setToolTip(f"{percent}%")
+
+    def on_csv_finished(self, saved_paths):
+        self.csv_convert_in_progress = False
+        self._set_file_save_status(
+            self.current_file_state,
+            self.current_output_file,
+        )
+        self._show_saved_csv_paths(saved_paths)
+        self.log(
+            "CSV conversion complete: "
+            + ", ".join(Path(p).name for p in saved_paths)
+        )
+        self.csv_worker = None
+
+    def on_csv_error(self, error_message):
+        self.csv_convert_in_progress = False
+        self._set_file_save_status(
+            self.current_file_state,
+            self.current_output_file,
+        )
+        self._show_saved_csv_paths([])
+        self.log(f"CSV conversion failed: {error_message}")
+        self.csv_worker = None
 
     def _build_ui(self):
         root = QtWidgets.QWidget()
@@ -763,13 +1228,19 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         left.setSpacing(8)
 
         title = QtWidgets.QLabel("Bedside Monitor Workflow")
-        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: 600;"
+            f"color:{self._cfg_color('text', 'accent', '#111111')};"
+        )
         left.addWidget(title)
 
         def _hint(text):
             label = QtWidgets.QLabel(text)
             label.setWordWrap(True)
-            label.setStyleSheet("color: #3e4a5a; font-size: 11px;")
+            label.setStyleSheet(
+                "font-size: 11px;"
+                f"color:{self._cfg_color('text', 'secondary', '#3e4a5a')};"
+            )
             return label
 
         self.conn_section = CollapsibleSection(
@@ -787,6 +1258,57 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.conn_section.content_layout.addWidget(
             _hint("Next: confirm monitor source and move to signal setup.")
         )
+
+        self.file_save_section = CollapsibleSection(
+            "File Save Status",
+            expanded=True,
+        )
+        left.addWidget(self.file_save_section)
+        self.file_save_section.content_layout.addWidget(
+            QtWidgets.QLabel("Current DRC File")
+        )
+        self.save_file_name_label = QtWidgets.QLabel("No output file")
+        self.save_file_name_label.setWordWrap(True)
+        self.save_file_name_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.file_save_section.content_layout.addWidget(
+            self.save_file_name_label
+        )
+
+        self.convert_csv_btn = QtWidgets.QPushButton(
+            "Convert Current DRC to CSV"
+        )
+        self.convert_csv_btn.setVisible(False)
+        self.convert_csv_btn.setEnabled(False)
+        self.convert_csv_btn.clicked.connect(self.convert_current_drc_to_csv)
+        self.file_save_section.content_layout.addWidget(self.convert_csv_btn)
+
+        self.convert_saved_header = QtWidgets.QLabel("Saved CSV Files")
+        self.convert_saved_header.setVisible(False)
+        self.file_save_section.content_layout.addWidget(
+            self.convert_saved_header
+        )
+
+        self.convert_saved_list = QtWidgets.QListWidget()
+        self.convert_saved_list.setVisible(False)
+        self.convert_saved_list.setMaximumHeight(88)
+        self.convert_saved_list.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAlwaysOff
+        )
+        self.convert_saved_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.NoSelection
+        )
+        self.convert_saved_list.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.convert_saved_list.setTextElideMode(QtCore.Qt.ElideLeft)
+        self.file_save_section.content_layout.addWidget(
+            self.convert_saved_list
+        )
+
+        self.file_save_section.content_layout.addWidget(
+            _hint("Blue: appending. Green: closed and ready to convert.")
+        )
+        self._set_file_save_status("default", "")
 
         view_section = CollapsibleSection("Session Setup", expanded=True)
         left.addWidget(view_section)
@@ -890,6 +1412,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         catalog_scroll = QtWidgets.QScrollArea()
         catalog_scroll.setWidgetResizable(True)
+        catalog_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAlwaysOff
+        )
         catalog_scroll.setMinimumHeight(120)
         catalog_scroll.setMaximumHeight(220)
         catalog_inner = QtWidgets.QWidget()
@@ -898,13 +1423,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         catalog_grid.setHorizontalSpacing(4)
         catalog_grid.setVerticalSpacing(4)
 
-        cols = 2
+        cols = 3
         for idx, item in enumerate(self.all_wave_defs):
             row_id = int(item["row_identifier"])
             label = item.get("label") or item.get("title") or ""
-            btn = QtWidgets.QPushButton(f"#{row_id} {label}")
+            btn = QtWidgets.QPushButton(_compact_label_start(label, max_len=8))
             btn.setCheckable(True)
-            btn.setMinimumWidth(140)
+            btn.setToolTip(label)
+            btn.setMinimumWidth(90)
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed,
+            )
             btn.setProperty("row_id", row_id)
             btn.toggled.connect(
                 lambda checked, rid=row_id: self._on_wave_request_clicked(
@@ -945,14 +1475,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         trends_layout.setContentsMargins(0, 0, 0, 0)
         trends_layout.setSpacing(8)
 
-        trend_colors = ["#2b83f6", "#24b47e", "#b38ddb", "#6fd3ff"]
+        trend_fallbacks = ["#2b83f6", "#24b47e", "#b38ddb", "#6fd3ff"]
         for idx, item in enumerate(self.trend_defs):
             plot = pg.PlotWidget(title=item["title"])
-            plot.showGrid(x=True, y=True, alpha=0.2)
+            self._style_plot_widget(plot)
             plot.setLabel("left", text=item["label"], units=item["unit"])
             curve = plot.plot(
                 pen=pg.mkPen(
-                    trend_colors[idx % len(trend_colors)],
+                    self._resolve_signal_color(
+                        "trends",
+                        item,
+                        trend_fallbacks[idx % len(trend_fallbacks)],
+                    ),
                     width=2,
                 )
             )
@@ -965,14 +1499,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         waves_layout.setContentsMargins(0, 0, 0, 0)
         waves_layout.setSpacing(8)
 
-        wave_colors = ["#f23c3c", "#ff8c42", "#ff5a7a", "#f6d743"]
+        wave_fallbacks = ["#f23c3c", "#ff8c42", "#ff5a7a", "#f6d743"]
         for idx, item in enumerate(self.wave_defs):
             plot = pg.PlotWidget(title=item["title"])
-            plot.showGrid(x=True, y=True, alpha=0.2)
+            self._style_plot_widget(plot)
             plot.setLabel("left", text=item["label"], units=item["unit"])
             curve = plot.plot(
                 pen=pg.mkPen(
-                    wave_colors[idx % len(wave_colors)],
+                    self._resolve_signal_color(
+                        "waveforms",
+                        item,
+                        wave_fallbacks[idx % len(wave_fallbacks)],
+                    ),
                     width=1.5,
                 )
             )
@@ -998,14 +1536,22 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.last_record_label = QtWidgets.QLabel(
             "Last record (header UTC): --"
         )
-        self.last_record_label.setStyleSheet("font-weight: 600;")
+        self.last_record_label.setStyleSheet(
+            "font-weight: 600;"
+            f"color:{self._cfg_color('text', 'primary', '#111111')};"
+        )
         self.elapsed_label = QtWidgets.QLabel("Elapsed (header): --")
-        self.elapsed_label.setStyleSheet("font-weight: 600;")
+        self.elapsed_label.setStyleSheet(
+            "font-weight: 600;"
+            f"color:{self._cfg_color('text', 'primary', '#111111')};"
+        )
         self.recent_waves_label = QtWidgets.QLabel(
             "Waveforms (last 5s): none"
         )
         self.recent_waves_label.setWordWrap(True)
-        self.recent_waves_label.setStyleSheet("color: #23364d;")
+        self.recent_waves_label.setStyleSheet(
+            f"color:{self._cfg_color('text', 'secondary', '#23364d')};"
+        )
         header_layout.addWidget(self.last_record_label, 0)
         header_layout.addWidget(self.elapsed_label, 0)
         header_layout.addWidget(self.recent_waves_label, 1)
@@ -1288,6 +1834,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         plot.setTitle(selected["title"])
         plot.setLabel("left", text=selected["label"], units=selected["unit"])
+        if category == "trend":
+            curve_color = self._resolve_signal_color(
+                "trends",
+                selected,
+                "#2b83f6",
+            )
+            self.trend_curves[slot_id].setPen(pg.mkPen(curve_color, width=2))
+        else:
+            curve_color = self._resolve_signal_color(
+                "waveforms",
+                selected,
+                "#f23c3c",
+            )
+            self.wave_curves[slot_id].setPen(pg.mkPen(curve_color, width=1.5))
         self.refresh_slot_buttons()
         if category == "trend":
             self.update_plots()
@@ -1444,6 +2004,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.worker.package_signal.connect(self.on_package)
         self.worker.wave_mapping_signal.connect(self.on_wave_mapping)
         self.worker.status_signal.connect(self.log)
+        self.worker.file_status_signal.connect(self.on_file_status)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.error_signal.connect(self.on_error)
 
@@ -1462,6 +2023,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         self._update_graph_header()
         self.worker.start()
+
+    def on_file_status(self, state, output_file):
+        if state == "appending":
+            self._set_file_save_status("blue", output_file)
+            self.log(f"Appending to: {Path(output_file).name}")
+            return
+        if state == "closed":
+            self._set_file_save_status("green", output_file)
+            self.log(f"Closed file: {Path(output_file).name}")
 
     def stop_capture(self):
         if self.worker is not None and self.worker.isRunning():
@@ -1522,7 +2092,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.selector_filter_dirty["wave"] = True
 
         if self.simulation_mode:
-            self.sim_idle_timer.start()
+            # Keep GUI open in simulation mode when stream pauses.
+            self.sim_idle_timer.stop()
 
         # Update wave request catalog: any row that produced positive samples
         # is timestamped, and displayed rows are auto-requested.
@@ -1708,12 +2279,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def on_finished(self, output_file):
         self.update_plots()
+        self.sim_idle_timer.stop()
         self.log(f"Capture finished. Saved: {output_file}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        if self.simulation_mode:
-            self.log("Simulation mode: auto-close in 10s")
-            self.sim_idle_timer.start()
 
     def on_error(self, error_message):
         self.sim_idle_timer.stop()
@@ -1722,10 +2291,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.stop_btn.setEnabled(False)
 
     def _on_simulation_idle_timeout(self):
-        self.log("No package for 10 seconds in simulation mode; closing")
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.request_stop()
-        QtCore.QTimer.singleShot(800, self.close)
+        self.log("No package for 10 seconds in simulation mode")
 
     # --- Waveform request catalog ----------------------------------------
 
@@ -1751,14 +2317,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return "yellow"
         return "default"
 
-    _WAVE_BTN_STYLES = {
-        "green": "background:#3ab36b;color:white;font-weight:600;",
-        "blue": "background:#2b83f6;color:white;font-weight:600;",
-        "yellow": "background:#f0c419;color:#222;font-weight:600;",
-        "red": "background:#d6352b;color:white;font-weight:600;",
-        "default": "",
-    }
-
     def _apply_wave_request_button_style(self, row_id):
         if self._is_closing:
             return
@@ -1767,7 +2325,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
         try:
             state = self._wave_request_button_state(row_id)
-            btn.setStyleSheet(self._WAVE_BTN_STYLES.get(state, ""))
+            btn.setStyleSheet(self._wave_button_style_for_state(state))
             btn.setProperty("color_state", state)
             btn.blockSignals(True)
             btn.setChecked(row_id in self.wave_requested_rows)
