@@ -958,6 +958,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.resize(1300, 760)
 
         self.config = config
+        self.config_path = Path(config.get("path", ""))
         self.colors = config.get("colors", {})
         self.all_trend_defs = config["all_trend_defs"]
         self.all_wave_defs = config["all_wave_defs"]
