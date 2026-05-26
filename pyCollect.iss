@@ -10,10 +10,6 @@ OutputDir=.
 OutputBaseFilename=pyCollect_Setup
 SetupIconFile=assets\icon.ico
 UninstallDisplayIcon={app}\pyCollect.exe
-#ifndef NO_SIGNING
-SignTool=signtool
-SignedUninstaller=yes
-#endif
 
 [Dirs]
 Name: "{userappdata}\Local\pyCollect"

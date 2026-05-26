@@ -1,0 +1,114 @@
+{
+  "signal_sources": {},
+  "ui": {
+    "connection": {
+      "baudrate": 19200
+    },
+    "simulator": {
+      "speed_multiplier": 20.0
+    },
+    "duration_sec": 3600,
+    "trend_window_sec": 45,
+    "wave_window_sec": 300.0,
+    "graph_split_ratio": 0.5084925690021231
+  },
+  "channels": {
+    "trends": [
+      {
+        "row_identifier": 39
+      },
+      {
+        "row_identifier": 37
+      },
+      {
+        "row_identifier": 49
+      },
+      {
+        "row_identifier": 45
+      },
+      {
+        "row_identifier": 34
+      },
+      {
+        "row_identifier": 1
+      },
+      {
+        "row_identifier": 7
+      },
+      {
+        "row_identifier": 10
+      },
+      {
+        "row_identifier": 11
+      },
+      {
+        "row_identifier": 8
+      },
+      {
+        "row_identifier": 5
+      },
+      {
+        "row_identifier": 12
+      },
+      {
+        "row_identifier": 14
+      },
+      {
+        "row_identifier": 15
+      },
+      {
+        "row_identifier": 16
+      },
+      {
+        "row_identifier": 17
+      },
+      {
+        "row_identifier": 19
+      },
+      {
+        "row_identifier": 20
+      },
+      {
+        "row_identifier": 21
+      },
+      {
+        "row_identifier": 22
+      },
+      {
+        "row_identifier": 23
+      },
+      {
+        "row_identifier": 24
+      },
+      {
+        "row_identifier": 25
+      },
+      {
+        "row_identifier": 26
+      },
+      {
+        "row_identifier": 27
+      },
+      {
+        "row_identifier": 28
+      },
+      {
+        "row_identifier": 29
+      }
+    ],
+    "waves": [
+      {
+        "row_identifier": 5
+      },
+      {
+        "row_identifier": 10
+      },
+      {
+        "row_identifier": 13
+      },
+      {
+        "row_identifier": 14
+      }
+    ]
+  }
+}
