@@ -245,7 +245,7 @@ def load_signal_config(base_dir, config_path=None):
 
 
 class CollapsibleSection(QtWidgets.QWidget):
-    def __init__(self, title, expanded=True, parent=None, lockable=False, on_lock_callback=None):
+    def __init__(self, title, expanded=True, parent=None):
         super().__init__(parent)
         self.title = title
         self.toggle_btn = QtWidgets.QToolButton()
@@ -256,16 +256,13 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.toggle_btn.setArrowType(
             QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow
         )
-        # Left-align text/arrow so lock button on right doesn't push title to center.
         self.toggle_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
         )
         self.toggle_btn.setStyleSheet("QToolButton { text-align: left; padding-left: 2px; }")
 
         self.is_locked = False
-        self.lockable = lockable
-        self.on_lock_callback = on_lock_callback
-        
+
         self.content = QtWidgets.QWidget()
         self.content_layout = QtWidgets.QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(8, 6, 8, 6)
@@ -275,91 +272,39 @@ class CollapsibleSection(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        
-        # Create header layout with toggle and optional lock button
-        header_layout = QtWidgets.QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(4)
-        header_layout.addWidget(self.toggle_btn, 1)
-        
-        if lockable:
-            self.lock_btn = QtWidgets.QPushButton("🔓")
-            self.lock_btn.setMaximumWidth(40)
-            self.lock_btn.setFlat(True)
-            self.lock_btn.setStyleSheet("color: #2fa44f; font-size: 12px; padding: 2px;")
-            self.lock_btn.clicked.connect(self._toggle_lock)
-            header_layout.addWidget(self.lock_btn)
-        
-        header_widget = QtWidgets.QWidget()
-        header_widget.setLayout(header_layout)
-        root.addWidget(header_widget)
+        root.addWidget(self.toggle_btn)
         root.addWidget(self.content)
 
         self.toggle_btn.toggled.connect(self._on_toggled)
 
     def _on_toggled(self, checked):
+        if self.is_locked and checked:
+            # Prevent expanding a locked section.
+            self.toggle_btn.blockSignals(True)
+            self.toggle_btn.setChecked(False)
+            self.toggle_btn.blockSignals(False)
+            return
         self.content.setVisible(checked)
         self.toggle_btn.setArrowType(
             QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
         )
         self._update_lock_appearance()
-    
-    def _toggle_lock(self):
-        self.set_locked(not self.is_locked)
 
     def set_locked(self, locked):
         self.is_locked = locked
         self._update_lock_appearance()
-        if self.on_lock_callback:
-            self.on_lock_callback(locked)
-    
+
     def _update_lock_appearance(self):
-        """Update UI appearance based on lock state."""
-        if not self.lockable:
-            return
-
-        # Preserve left-aligned style on toggle_btn regardless of lock state.
+        """Update header appearance based on lock state."""
         base_align = "QToolButton { text-align: left; padding-left: 2px;"
-        # Update lock button appearance (only re-style if it is still enabled).
-        if self.lock_btn.isEnabled():
-            if self.is_locked:
-                self.lock_btn.setText("🔒")
-                self.lock_btn.setStyleSheet(
-                    "color: #ff4757; font-size: 12px; padding: 2px;"
-                )
-            else:
-                self.lock_btn.setText("🔓")
-                self.lock_btn.setStyleSheet(
-                    "color: #2fa44f; font-size: 12px; padding: 2px;"
-                )
-
-        # Update toggle button header background
         if self.is_locked:
             self.toggle_btn.setStyleSheet(
                 base_align + " color: #888888; background: #1a1a1a; }"
             )
         else:
             self.toggle_btn.setStyleSheet(base_align + " }")
-
-        # Update content styling and control states
         self._apply_content_lock_state()
 
-    def set_lock_control_enabled(self, enabled):
-        """Enable/disable the lock toggle button itself (role-based).
-
-        When disabled, the lock icon is grayed and cannot be clicked, but
-        the current lock state (locked/unlocked) is preserved.
-        """
-        if not self.lockable:
-            return
-        self.lock_btn.setEnabled(bool(enabled))
-        if not enabled:
-            self.lock_btn.setStyleSheet(
-                "color: #555555; font-size: 12px; padding: 2px;"
-            )
-        else:
-            self._update_lock_appearance()
-    
     def _apply_content_lock_state(self):
         """Apply lock/unlock styling to all child widgets."""
         for widget in self._get_editable_widgets():
@@ -1032,7 +977,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self._apply_pcs_theme()
         self._build_ui()
         self._connect_signals()
-        self._restore_section_locks()
+        self._restore_lock_state()
         self.refresh_ports()
 
         if initial_duration is not None:
@@ -1447,103 +1392,62 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-    def _on_section_lock_changed(self, section_name, locked):
-        """Handle section lock state change - persist to config."""
-        if self.config_path.exists():
-            try:
-                cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
-                if "ui" not in cfg:
-                    cfg["ui"] = {}
-                if "section_locks" not in cfg["ui"]:
-                    cfg["ui"]["section_locks"] = {}
-                cfg["ui"]["section_locks"][section_name] = locked
-                self.config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+    def _all_lockable_sections(self):
+        """All sidebar sections that can be locked (excludes Advanced itself)."""
+        return [s for s in [
+            getattr(self, "conn_section", None),
+            getattr(self, "file_save_section", None),
+            getattr(self, "wave_catalog_section", None),
+            getattr(self, "view_section", None),
+            getattr(self, "capture_section", None),
+            getattr(self, "signal_section", None),
+            getattr(self, "status_section", None),
+        ] if s is not None]
 
-    def _restore_section_locks(self):
-        """Restore section lock states from config."""
+    def _toggle_all_locks(self):
+        """Lock all currently-collapsed sections, or unlock all if any are locked."""
+        sections = self._all_lockable_sections()
+        any_locked = any(s.is_locked for s in sections)
+        if any_locked:
+            for s in sections:
+                s.set_locked(False)
+            self._lock_btn.setText("🔓  Lock collapsed sections")
+        else:
+            for s in sections:
+                if not s.toggle_btn.isChecked():  # collapsed
+                    s.set_locked(True)
+            if any(s.is_locked for s in sections):
+                self._lock_btn.setText("🔒  Unlock all sections")
+        self._persist_lock_state()
+
+    def _persist_lock_state(self):
+        """Persist list of locked section titles to config."""
+        if not self.config_path.exists():
+            return
+        try:
+            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+            cfg.setdefault("ui", {})
+            cfg["ui"]["locked_sections"] = [
+                s.title for s in self._all_lockable_sections() if s.is_locked
+            ]
+            self.config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _restore_lock_state(self):
+        """Restore locked sections from config on startup."""
         try:
             if not self.config_path.exists():
                 return
             cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
-            locks = cfg.get("ui", {}).get("section_locks", {})
-            
-            # Map section names to CollapsibleSection objects
-            section_map = {
-                "monitor_connection": getattr(self, "conn_section", None),
-                "session_setup": getattr(self, "view_section", None),
-                "monitoring_control": getattr(self, "capture_section", None),
-            }
-            
-            for section_name, locked in locks.items():
-                section = section_map.get(section_name)
-                if section and hasattr(section, "set_locked"):
-                    section.set_locked(bool(locked))
+            locked_titles = cfg.get("ui", {}).get("locked_sections", [])
+            for s in self._all_lockable_sections():
+                if s.title in locked_titles:
+                    s.set_locked(True)
+            if any(s.is_locked for s in self._all_lockable_sections()):
+                self._lock_btn.setText("🔒  Unlock all sections")
         except Exception:
             pass
-
-        # Apply current user role permissions to the lock controls.
-        self._apply_user_role_permissions()
-
-    # Sections whose locks should be forced/managed by role policy:
-    # monitor communication sections (Monitor Connection + Monitoring Control).
-    _MONITOR_COMM_SECTIONS = ("monitor_connection", "monitoring_control")
-
-    def _role_section_map(self):
-        return {
-            "monitor_connection": getattr(self, "conn_section", None),
-            "session_setup": getattr(self, "view_section", None),
-            "monitoring_control": getattr(self, "capture_section", None),
-        }
-
-    def _on_user_role_changed(self, role):
-        """Persist user role to config and re-apply role permissions."""
-        if self.config_path.exists():
-            try:
-                cfg = json.loads(
-                    self.config_path.read_text(encoding="utf-8")
-                )
-                cfg["user_role"] = role
-                self.config_path.write_text(
-                    json.dumps(cfg, indent=2), encoding="utf-8"
-                )
-            except Exception:
-                pass
-        self._apply_user_role_permissions()
-
-    def _apply_user_role_permissions(self):
-        """Enforce lock-edit permissions and forced locks based on role.
-
-        - Administrator: lock toggles editable; user controls lock state.
-        - Reviewer: monitor communication sections forced LOCKED,
-          and all lock toggles are read-only (greyed).
-        - Recorded: all lock toggles read-only (greyed); lock states preserved.
-        """
-        combo = getattr(self, "user_role_combo", None)
-        if combo is None:
-            return
-        role = combo.currentText()
-        sections = self._role_section_map()
-
-        if role == "Administrator":
-            for sec in sections.values():
-                if sec is not None:
-                    sec.set_lock_control_enabled(True)
-        elif role == "Reviewer":
-            # Force lock on monitor communication sections.
-            for name in self._MONITOR_COMM_SECTIONS:
-                sec = sections.get(name)
-                if sec is not None and not sec.is_locked:
-                    sec.set_locked(True)
-            # Disable lock controls for all sections in reviewer mode.
-            for sec in sections.values():
-                if sec is not None:
-                    sec.set_lock_control_enabled(False)
-        else:  # Recorded
-            for sec in sections.values():
-                if sec is not None:
-                    sec.set_lock_control_enabled(False)
 
     def _build_ui(self):
         root = QtWidgets.QWidget()
@@ -1585,8 +1489,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.conn_section = CollapsibleSection(
             "Monitor Connection",
             expanded=True,
-            lockable=True,
-            on_lock_callback=lambda locked: self._on_section_lock_changed("monitor_connection", locked)
         )
         left.addWidget(self.conn_section)
         self.port_combo = QtWidgets.QComboBox()
@@ -1677,13 +1579,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         self._set_file_save_status("default", "")
 
-        view_section = CollapsibleSection(
-            "Session Setup", 
+        self.view_section = CollapsibleSection(
+            "Session Setup",
             expanded=True,
-            lockable=True,
-            on_lock_callback=lambda locked: self._on_section_lock_changed("session_setup", locked)
         )
-        self.view_section = view_section
         left.addWidget(self.view_section)
 
         self.duration_spin = QtWidgets.QSpinBox()
@@ -1717,8 +1616,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.capture_section = CollapsibleSection(
             "Monitoring Control",
             expanded=True,
-            lockable=True,
-            on_lock_callback=lambda locked: self._on_section_lock_changed("monitoring_control", locked)
         )
         left.addWidget(self.capture_section)
         self.start_btn = QtWidgets.QPushButton("Start Monitoring")
@@ -1730,13 +1627,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             _hint("Start to begin bedside recording.")
         )
 
-        signal_section = CollapsibleSection("Signal Setup", expanded=True)
-        left.addWidget(signal_section)
+        self.signal_section = CollapsibleSection("Signal Setup", expanded=True)
+        left.addWidget(self.signal_section)
         selector_grid = QtWidgets.QGridLayout()
         selector_grid.setContentsMargins(0, 0, 0, 0)
         selector_grid.setHorizontalSpacing(6)
         selector_grid.setVerticalSpacing(6)
-        signal_section.content_layout.addLayout(selector_grid)
+        self.signal_section.content_layout.addLayout(selector_grid)
 
         for row in range(4):
             trend_btn = QtWidgets.QPushButton()
@@ -1760,12 +1657,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 )
             )
 
-        status_section = CollapsibleSection("Recorder Output", expanded=True)
-        left.addWidget(status_section)
+        self.status_section = CollapsibleSection("Recorder Output", expanded=True)
+        left.addWidget(self.status_section)
         self.status_box = QtWidgets.QPlainTextEdit()
         self.status_box.setReadOnly(True)
         self.status_box.setMaximumBlockCount(500)
-        status_section.content_layout.addWidget(self.status_box)
+        self.status_section.content_layout.addWidget(self.status_box)
 
         # Waveform Request Catalog: full list of available waveforms.
         # Buttons are color-coded by state machine; see
@@ -1776,7 +1673,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             expanded=False,
         )
         left.insertWidget(
-            left.indexOf(view_section),
+            left.indexOf(self.view_section),
             self.wave_catalog_section,
         )
         self.wave_catalog_section.content_layout.addWidget(
@@ -1826,26 +1723,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.advanced_section = CollapsibleSection("Advanced", expanded=False)
         left.addWidget(self.advanced_section)
 
-        # User role selector (controls who can change section locks)
+        # Single lock button: locks all currently-collapsed sections.
+        self._lock_btn = QtWidgets.QPushButton("🔓  Lock collapsed sections")
+        self._lock_btn.clicked.connect(self._toggle_all_locks)
+        self.advanced_section.content_layout.addWidget(self._lock_btn)
         self.advanced_section.content_layout.addWidget(
-            QtWidgets.QLabel("User Role")
-        )
-        self.user_role_combo = QtWidgets.QComboBox()
-        self.user_role_combo.addItems(["Administrator", "Reviewer", "Recorded"])
-        initial_role = self.config.get("user_role", "Administrator")
-        idx = self.user_role_combo.findText(initial_role)
-        if idx >= 0:
-            self.user_role_combo.setCurrentIndex(idx)
-        self.user_role_combo.currentTextChanged.connect(
-            self._on_user_role_changed
-        )
-        self.advanced_section.content_layout.addWidget(self.user_role_combo)
-        self.advanced_section.content_layout.addWidget(
-            _hint(
-                "Administrator: all locks editable. "
-                "Reviewer: monitor comm sections forced locked. "
-                "Recorded: locks read-only."
-            )
+            _hint("Locks all currently collapsed sections. Click again to unlock all.")
         )
 
         self.sim_speed_spin = QtWidgets.QDoubleSpinBox()
