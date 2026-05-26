@@ -2378,6 +2378,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     gap_sec=1.0,
                 )
                 self.trend_curves[item["id"]].setData(x_data, y_data)
+                latest = points[-1][1]
+                fmt = f"{latest:.0f}" if latest == round(latest) else f"{latest:.1f}"
+                self.trend_plots[item["id"]].setTitle(
+                    f"{item['title']} : {fmt}"
+                )
             self.trend_plots[item["id"]].setXRange(
                 0,
                 trend_window,
