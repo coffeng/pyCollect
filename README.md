@@ -688,6 +688,111 @@ re-verified during future regression checks.
 ### Enumerated Requirements For Future Verification
 
 1. `python pycollect.py --help` must list `--output` and
+
+---
+
+## Planned Repository Reorganization
+
+> **Status: PLANNED — not yet executed.**
+> This section documents the agreed folder structure before any files are moved.
+
+### Motivation
+
+The current root folder mixes Python source, test scripts, config files, generated
+output files, and log files at the same level. The reorganization separates
+concerns so that each file type lives in a predictable location and the root stays
+minimal.
+
+### Proposed Folder Layout
+
+```
+pyCollect/
+│
+├── README.md                        ← project documentation (stays in root)
+├── requirements.txt                 ← Python dependencies (stays in root)
+├── .gitignore                       ← updated to reflect new paths
+├── run_pycollect.bat                ← Windows launcher (stays in root; paths updated)
+├── run_pycollect.sh                 ← Unix launcher (stays in root; paths updated)
+│
+├── code/                            ← all Python source scripts
+│   ├── pycollect.py                 ← core CLI: capture, protocol, DRC I/O
+│   ├── pycollect_qt_gui.py          ← PyQt5 desktop GUI
+│   ├── drc_2_csv.py                 ← DRC-to-CSV converter
+│   ├── drc_monitor_simulator.py     ← replays DRC as simulated serial stream
+│   └── serial_bridge.py             ← serial port forwarding utility
+│
+├── tests/                           ← all automated tests (unit + smoke)
+│   ├── test_pycollect_simulator_5_records.py
+│   ├── ui_sidebar_smoke_test.py
+│   ├── ui_lock_role_smoke_test.py
+│   └── ui_waveform_catalog_smoke_test.py
+│
+├── config/                          ← static signal definitions and GUI config
+│   ├── pycollect_gui_config.json    ← waveform/trend selections and UI settings
+│   ├── params5.txt                  ← trend channel metadata (label, unit, divider)
+│   └── waves5.txt                   ← waveform channel metadata (SR, label, unit)
+│
+├── input/                           ← reference and test DRC input files
+│   ├── headless_test.drc            ← used for headless/terminal smoke runs
+│   └── record_timeout_test.drc     ← timeout edge-case test fixture
+│
+└── output/                          ← generated files (gitignored)
+    ├── *.drc                        ← recorded DRC files from live or simulator runs
+    ├── *_trends.csv                 ← CSV exports (trend channels)
+    ├── *_waves.csv                  ← CSV exports (waveform channels)
+    └── *.log                        ← conversion and session log files
+```
+
+### Files That Stay in Root
+
+| File | Reason |
+|---|---|
+| `README.md` | Standard project documentation entry point |
+| `requirements.txt` | Tooling convention: dependency files at root |
+| `.gitignore` | Git convention: must be at repo root |
+| `run_pycollect.bat` | End-user launcher; discoverable at root |
+| `run_pycollect.sh` | End-user launcher; discoverable at root |
+
+### Files Removed from Root (Moved or Gitignored)
+
+| Current file | Destination | Notes |
+|---|---|---|
+| `pycollect.py` | `code/` | core script |
+| `pycollect_qt_gui.py` | `code/` | GUI module |
+| `drc_2_csv.py` | `code/` | converter |
+| `drc_monitor_simulator.py` | `code/` | simulator |
+| `serial_bridge.py` | `code/` | utility |
+| `ui_sidebar_smoke_test.py` | `tests/` | smoke test |
+| `ui_lock_role_smoke_test.py` | `tests/` | smoke test |
+| `ui_waveform_catalog_smoke_test.py` | `tests/` | smoke test |
+| `test_pycollect_simulator_5_records.py` | `tests/` | integration test |
+| `pycollect_gui_config.json` | `config/` | signal config |
+| `params5.txt` | `config/` | channel metadata |
+| `waves5.txt` | `config/` | channel metadata |
+| `headless_test.drc` | `input/` | test fixture |
+| `record_timeout_test.drc` | `input/` | test fixture |
+| `record.drc` | `output/` (gitignored) | generated recording |
+| `record_trends.csv` | `output/` (gitignored) | generated CSV |
+| `record_waves.csv` | `output/` (gitignored) | generated CSV |
+| `*.log` | `output/` (gitignored) | generated logs |
+
+### Required Code Changes When Executing
+
+1. **`run_pycollect.bat` / `run_pycollect.sh`**: update all script paths from
+   e.g. `pycollect.py` → `code\pycollect.py` and default output path to
+   `output\record.drc`; pass `--config config\pycollect_gui_config.json`.
+2. **`code/pycollect.py`**: update default config path and any relative path
+   references to `params5.txt` / `waves5.txt` to resolve from `config/`.
+3. **`code/pycollect_qt_gui.py`**: same config path update; ensure `import
+   pycollect` resolves (add `code/` to `sys.path` or use a `conftest.py`).
+4. **`tests/`**: add a `conftest.py` (or update `sys.path` at top of each test)
+   so `import pycollect_qt_gui` finds scripts in `code/` and the config in
+   `config/`.
+5. **`.gitignore`**: add `output/` directory contents; keep `output/.gitkeep`
+   so the empty folder is tracked.
+6. **Smoke test runner**: update `QT_QPA_PLATFORM=offscreen` invocations to
+   run from the `tests/` folder or pass explicit paths.
+
   `--simulation-mode` options.
 2. `python -m py_compile pycollect.py pycollect_qt_gui.py` must complete
   without errors.
@@ -727,7 +832,6 @@ re-verified during future regression checks.
   show `--debug-stdout`; GUI log lines must be mirrored to stdout when used.
 
 
----
 
 ## DOC2822852 Product Requirements Traceability
 
@@ -745,9 +849,9 @@ Legend:
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
-| PS_COLLECT_UI_001 / URS_001 | Registration via password. | ❌ | No password / registration prompt in `pycollect_qt_gui.py`. The new **User Role** combo (Admin/Reviewer/Recorded) is a UX permission layer, not authenticated registration. |
+| ~~PS_COLLECT_UI_001 / URS_001~~ | ~~Registration via password.~~ | ~~❌~~ | ~~No password / registration prompt in `pycollect_qt_gui.py`. The new **User Role** combo (Admin/Reviewer/Recorded) is a UX permission layer, not authenticated registration.~~ |
 | PS_COLLECT_UI_002 | Restart reuses previous session config (paths, waveform & parameter selections) without explicit save. | ✅ | `pycollect_gui_config.json` is read at startup and written on close (`_save_runtime_config`); channel selections, baudrate, trend interval, section locks, and user role all persist. |
-| PS_COLLECT_UI_003 / URS_003 | Indicate "not intended for clinical use" (research only). | ❌ | No on-screen disclaimer banner / startup notice currently shown in the GUI. |
+| ~~PS_COLLECT_UI_003 / URS_003~~ | ~~Indicate "not intended for clinical use" (research only).~~ | ~~❌~~ | ~~No on-screen disclaimer banner / startup notice currently shown in the GUI.~~ |
 
 #### 5.1.2 OnLine Mode
 
@@ -814,7 +918,7 @@ Legend:
 |---|---|
 | ✅ Implemented | 11 |
 | 🟡 Partial | 6 |
-| ❌ Missing | 9 |
+| ❌ Missing | 7 |
 
 ### Top Gaps to Close Next
 
@@ -822,7 +926,9 @@ Legend:
 2. **Notes editor + persistence** (PS_009, PS_010).
 3. **Offline DRC browser** (PS_016): in-GUI playback / review of stored DRC files.
 4. **ASCII export refinements** (PS_017, PS_018, PS_019): tab-delimited output, channel subset, time-range subset.
-5. **Intended-use disclaimer** (PS_003, PS_M_002): startup banner + manual statement.
-6. **Password registration** (PS_001): authenticated unlock for ASCII conversion (legacy LabVIEW behavior).
+5. ~~**Intended-use disclaimer** (PS_003, PS_M_002): startup banner + manual statement.~~
+6. ~~**Password registration** (PS_001): authenticated unlock for ASCII conversion (legacy LabVIEW behavior).~~
 7. **Snapshot pop-up window** (PS_011): detachable detailed-analysis window during live collection.
 8. **Trend interval upper bound**: raise `trend_interval_spin` maximum from 120 s to 3600 s to meet PS_008.
+9. **All section headers should be lockable**: currently only Monitor Connection, Session Setup, and Monitoring Control are lockable; extend to all collapsible sections.
+10. **User role does not impact locking behavior yet**: the Administrator/Reviewer/Recorded role selector is present but does not enforce role-based lock policies on sections.
