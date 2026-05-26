@@ -964,10 +964,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.trend_curves = {}
         self.wave_plots = {}
         self.wave_curves = {}
-        self.selector_popups = {}
-        self.selector_filter_dirty = {
-            "trend": True,
-        }
+        self.trend_catalog_buttons = {}
 
         self.sim_idle_timer = QtCore.QTimer(self)
         self.sim_idle_timer.setSingleShot(True)
@@ -978,6 +975,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_request_state_timer.setInterval(1000)
         self.wave_request_state_timer.timeout.connect(
             self._refresh_wave_request_button_states
+        )
+        self.wave_request_state_timer.timeout.connect(
+            self._refresh_trend_button_states
         )
 
         self._apply_pcs_theme()
@@ -1635,12 +1635,52 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.signal_section = CollapsibleSection("Signal Setup", expanded=True)
         left.addWidget(self.signal_section)
-        self._select_trends_btn = QtWidgets.QPushButton("Select Trends...")
-        self._select_trends_btn.clicked.connect(self.open_trend_selector)
-        self.signal_section.content_layout.addWidget(self._select_trends_btn)
         self.signal_section.content_layout.addWidget(
-            _hint("Open the trend selector to choose which parameters to graph.")
+            _hint(
+                "Legend: blue\u00a0=\u00a0has data, green\u00a0=\u00a0selected+data, "
+                "light\u00a0green\u00a0=\u00a0selected+no\u00a0data."
+            )
         )
+        trend_catalog_scroll = QtWidgets.QScrollArea()
+        trend_catalog_scroll.setWidgetResizable(True)
+        trend_catalog_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAlwaysOff
+        )
+        trend_catalog_scroll.setMinimumHeight(120)
+        trend_catalog_scroll.setMaximumHeight(220)
+        trend_catalog_inner = QtWidgets.QWidget()
+        trend_catalog_grid = QtWidgets.QGridLayout(trend_catalog_inner)
+        trend_catalog_grid.setContentsMargins(0, 0, 0, 0)
+        trend_catalog_grid.setHorizontalSpacing(4)
+        trend_catalog_grid.setVerticalSpacing(4)
+
+        _trend_cols = 3
+        _selected_trend_rows = {int(d["row_identifier"]) for d in self.trend_defs}
+        for idx, item in enumerate(self.all_trend_defs):
+            row_id = int(item["row_identifier"])
+            label = item.get("label") or ""
+            btn = QtWidgets.QPushButton(_compact_label_start(label, max_len=8))
+            btn.setCheckable(True)
+            btn.setChecked(row_id in _selected_trend_rows)
+            btn.setToolTip(f"{label} [{item['unit']}]")
+            btn.setMinimumWidth(90)
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed,
+            )
+            btn.setProperty("row_id", row_id)
+            btn.toggled.connect(
+                lambda checked, rid=row_id: self._on_trend_catalog_clicked(
+                    rid, checked
+                )
+            )
+            self.trend_catalog_buttons[row_id] = btn
+            trend_catalog_grid.addWidget(
+                btn, idx // _trend_cols, idx % _trend_cols
+            )
+
+        trend_catalog_scroll.setWidget(trend_catalog_inner)
+        self.signal_section.content_layout.addWidget(trend_catalog_scroll)
 
         self.status_section = CollapsibleSection("Recorder Output", expanded=True)
         left.addWidget(self.status_section)
@@ -1803,7 +1843,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         graph_panel_layout.addWidget(self.graph_splitter, 1)
 
         layout.addWidget(self.graph_panel, 1)
-        self._prepare_selector_popups()
         self._update_graph_header()
 
     def _connect_signals(self):
@@ -1813,123 +1852,61 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.hr_window_spin.valueChanged.connect(self.update_plots)
         self.ecg_window_spin.valueChanged.connect(self.update_plots)
         self.graph_splitter.splitterMoved.connect(self.on_splitter_moved)
+        self.duration_spin.valueChanged.connect(self._save_runtime_config)
 
     def _prepare_selector_popups(self):
-        self.selector_popups["trend"] = self._build_trend_grid_popup()
+        pass  # Trend selection is now embedded in the Signal Setup sidebar section.
 
-    def _build_trend_grid_popup(self):
-        popup = QtWidgets.QDialog(self)
-        popup.setWindowTitle("Select Trend Parameters")
-        popup.resize(760, 520)
-        layout = QtWidgets.QVBoxLayout(popup)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        positive_only = QtWidgets.QCheckBox("Select only positive")
-        positive_only.setChecked(True)
-        layout.addWidget(positive_only)
-
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        layout.addWidget(scroll, 1)
-
-        container = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(container)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(6)
-
-        columns = 5
-        total = len(self.all_trend_defs)
-        rows = max(1, int(math.ceil(float(total) / float(columns))))
-        trend_buttons = []
-        selected_row_ids = {int(item["row_identifier"]) for item in self.trend_defs}
-        for idx, item in enumerate(self.all_trend_defs):
-            row = idx % rows
-            col = idx // rows
-            btn = QtWidgets.QPushButton(item["label"])
-            btn.setCheckable(True)
-            btn.setChecked(int(item["row_identifier"]) in selected_row_ids)
-            btn.setToolTip(
-                f"Row {item['row_identifier']} | "
-                f"{item['label']} [{item['unit']}]"
-            )
-            btn.toggled.connect(
-                lambda checked, selected=dict(item):
-                self._on_trend_toggle(selected, checked)
-            )
-            trend_buttons.append(
-                {
-                    "button": btn,
-                    "row_identifier": int(item["row_identifier"]),
-                }
-            )
-            grid.addWidget(btn, row, col)
-
-        scroll.setWidget(container)
-        positive_only.toggled.connect(
-            lambda _checked=False: self._apply_selector_filter(
-                "trend",
-                force=True,
-            )
-        )
-
-        close_btn = QtWidgets.QPushButton("Close")
-        close_btn.clicked.connect(popup.accept)
-        layout.addWidget(close_btn)
-
-        return {
-            "dialog": popup,
-            "positive_only": positive_only,
-            "trend_buttons": trend_buttons,
-        }
-
-    def _on_trend_toggle(self, item, checked):
-        """Called when a trend toggle button is clicked in the selector dialog."""
-        row_id = int(item["row_identifier"])
+    def _on_trend_catalog_clicked(self, row_id, checked):
+        """Called when a trend catalog button is toggled in the Signal Setup section."""
+        row_id = int(row_id)
         selected_row_ids = [int(d["row_identifier"]) for d in self.trend_defs]
+        all_trend_by_row = {int(item["row_identifier"]): item for item in self.all_trend_defs}
         if checked and row_id not in selected_row_ids:
-            selected = dict(item)
-            selected["id"] = f"t_{row_id}"
-            self.trend_defs.append(selected)
-            if selected["id"] not in self.trend_buffers:
-                self.trend_buffers[selected["id"]] = deque()
-            self._sync_all_trend_buffers()
-            self._rebuild_trend_plots()
+            item = all_trend_by_row.get(row_id)
+            if item:
+                selected = dict(item)
+                selected["id"] = f"t_{row_id}"
+                self.trend_defs.append(selected)
+                if selected["id"] not in self.trend_buffers:
+                    self.trend_buffers[selected["id"]] = deque()
+                self._sync_all_trend_buffers()
+                self._rebuild_trend_plots()
         elif not checked and row_id in selected_row_ids:
             self.trend_defs = [d for d in self.trend_defs
                                if int(d["row_identifier"]) != row_id]
             self._rebuild_trend_plots()
+        self._apply_trend_button_style(row_id)
 
-    def open_trend_selector(self):
-        """Open the trend selector dialog."""
-        # Rebuild the popup so checked state matches current trend_defs
-        self.selector_popups["trend"] = self._build_trend_grid_popup()
-        self._apply_selector_filter("trend", force=True)
-        self.selector_popups["trend"]["dialog"].exec_()
-
-    def _apply_selector_filter(self, category, force=False):
-        state = self.selector_popups.get(category)
-        if state is None:
+    def _apply_trend_button_style(self, row_id):
+        """Color-code a trend catalog button by selection + data state."""
+        btn = self.trend_catalog_buttons.get(row_id)
+        if btn is None:
             return
-        use_positive = state["positive_only"].isChecked()
-        if (
-            not force
-            and use_positive
-            and not self.selector_filter_dirty.get(category, True)
-        ):
+        selected = row_id in {int(d["row_identifier"]) for d in self.trend_defs}
+        has_positive = row_id in self.positive_trend_rows
+        if selected and has_positive:
+            bg, fg = "#2fa44f", "#ffffff"       # green
+        elif selected and not has_positive:
+            bg, fg = "#80c88a", "#1a2a1a"       # light green
+        elif not selected and has_positive:
+            bg, fg = "#00d4ff", "#0a1428"       # blue
+        else:
+            bg, fg = "", ""                     # theme default
+        try:
+            if bg:
+                btn.setStyleSheet(f"background-color:{bg}; color:{fg};")
+            else:
+                btn.setStyleSheet("")
+        except RuntimeError:
+            pass
+
+    def _refresh_trend_button_states(self):
+        """Recolor all trend catalog buttons (called by 1 Hz timer)."""
+        if self._is_closing:
             return
-
-        positive_rows = self.positive_trend_rows
-        for entry in state["trend_buttons"]:
-            row_id = entry["row_identifier"]
-            visible = True
-            if use_positive:
-                visible = row_id in positive_rows
-            entry["button"].setVisible(visible)
-
-        if use_positive:
-            self.selector_filter_dirty[category] = False
+        for row_id in list(self.trend_catalog_buttons.keys()):
+            self._apply_trend_button_style(row_id)
 
     # --- Graph panel rebuilding ------------------------------------------
 
@@ -1971,6 +1948,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.trends_layout.addWidget(plot)
 
         self.update_plots()
+        self._refresh_trend_button_states()
 
     def _rebuild_wave_plots(self):
         """Clear and recreate wave plots from self.wave_defs."""
@@ -2209,7 +2187,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.positive_trend_rows.update(positive_trend_rows)
         self.positive_wave_rows.update(positive_wave_rows)
         if len(self.positive_trend_rows) != prev_trend_count:
-            self.selector_filter_dirty["trend"] = True
+            self._refresh_trend_button_states()
 
         if self.simulation_mode:
             # Keep GUI open in simulation mode when stream pauses.

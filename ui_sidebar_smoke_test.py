@@ -135,29 +135,24 @@ def test_capture(win: gui.PyCollectQtWindow) -> None:
 
 def test_signal_selection(win: gui.PyCollectQtWindow) -> None:
     print("[4] Signal Selection section")
-    _expect(hasattr(win, "_select_trends_btn"),
-            "Signal Setup has Select Trends button")
-    _expect(isinstance(win._select_trends_btn, QtWidgets.QPushButton),
-            "_select_trends_btn is a QPushButton")
-    # Verify clicking the button does not crash. We patch QDialog.exec_
-    # to avoid blocking.
-    btn = win._select_trends_btn
-    original_exec = QtWidgets.QDialog.exec_
-
-    def fake_exec(self):
-        return QtWidgets.QDialog.Rejected
-
-    QtWidgets.QDialog.exec_ = fake_exec
+    _expect(hasattr(win, "trend_catalog_buttons"),
+            "trend_catalog_buttons dict exists")
+    _expect(len(win.trend_catalog_buttons) > 0,
+            "trend catalog has at least one button")
+    # Toggling a button should not crash and should update trend_defs.
+    first_row_id = next(iter(win.trend_catalog_buttons))
+    btn = win.trend_catalog_buttons[first_row_id]
+    was_checked = btn.isChecked()
     try:
-        btn.click()
+        btn.setChecked(not was_checked)
+        QtWidgets.QApplication.processEvents()
+        btn.setChecked(was_checked)
         QtWidgets.QApplication.processEvents()
         ok = True
     except Exception as exc:
         ok = False
         print(f"    exception: {exc}")
-    finally:
-        QtWidgets.QDialog.exec_ = original_exec
-    _expect(ok, "Select Trends button click opens selector without crash")
+    _expect(ok, "trend catalog button toggle does not crash")
 
 
 def test_waveform_catalog_collapsible(win: gui.PyCollectQtWindow) -> None:
