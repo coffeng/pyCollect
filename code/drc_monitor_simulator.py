@@ -15,10 +15,12 @@ flag/checksum bytes similarly to the legacy pycollect logic.
 import argparse
 import json
 import struct
+import threading
 import time
 from pathlib import Path
 
 import serial
+from local_control import LocalControlServer
 from serial import SerialException
 
 
@@ -105,6 +107,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Limit records per loop (0 means all)",
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=0,
+        help="Optional localhost TCP control port (supports: ping,status,stop)",
+    )
+    parser.add_argument(
+        "--simulation-mode",
+        action="store_true",
+        help="In simulation mode, send all records without waveform filtering; let GUI select waveforms",
     )
     return parser.parse_args()
 
@@ -488,6 +501,9 @@ def replay_once(
     speed_ctrl: "SpeedController",
     fallback_interval: float,
     wave_state: "WaveRequestState",
+    stop_event: threading.Event,
+    metrics: dict,
+    simulation_mode: bool = False,
 ):
     sent = 0
     base_interval = _estimate_base_interval(records, fallback_interval)
@@ -495,7 +511,10 @@ def replay_once(
     prev_time = None
 
     for rec_no, record, rec_time in records:
-        poll_wave_requests(ser, wave_state)
+        if stop_event.is_set():
+            break
+        if not simulation_mode:
+            poll_wave_requests(ser, wave_state)
 
         if speed_ctrl.refresh():
             print(
@@ -515,7 +534,7 @@ def replay_once(
         if delay > 0:
             time.sleep(delay)
 
-        filtered = apply_wave_request_filter(record, wave_state)
+        filtered = record if simulation_mode else apply_wave_request_filter(record, wave_state)
         if filtered is None:
             prev_time = rec_time
             continue
@@ -523,12 +542,13 @@ def replay_once(
         frame = frame_record(filtered)
         ser.write(frame)
         sent += 1
+        metrics["sent_total"] = int(metrics.get("sent_total", 0)) + 1
         prev_time = rec_time
         if sent % 25 == 0:
-            print(f"Sent {sent} records...")
+            print(f"Sent {sent} records...", flush=True)
         if max_records > 0 and sent >= max_records:
             break
-    print(f"Replay complete: {sent} records sent.")
+    print(f"Replay complete: {sent} records sent.", flush=True)
 
 
 def main():
@@ -545,18 +565,41 @@ def main():
     config_path = Path(args.config)
     speed_ctrl = SpeedController(config_path, args.speed)
     wave_state = WaveRequestState()
+    stop_event = threading.Event()
+    metrics = {"sent_total": 0}
+
+    def _on_control_stop():
+        stop_event.set()
+        return "stopping simulator"
+
+    def _on_control_status():
+        return (
+            f"running={not stop_event.is_set()} "
+            f"sent_total={metrics.get('sent_total', 0)}"
+        )
+
+    control = LocalControlServer(
+        name="simulator",
+        port=args.control_port,
+        on_stop=_on_control_stop,
+        on_status=_on_control_status,
+        logger=lambda msg: print(msg, flush=True),
+    )
+    control.start()
 
     use_rtscts = False if args.no_rtscts else bool(args.rtscts)
-    print(f"Loaded {len(records)} records from {drc_path}")
+    print(f"Loaded {len(records)} records from {drc_path}", flush=True)
     print(
         f"Opening {args.port} @ {args.baud}, "
-        f"parity={args.parity}, rtscts={use_rtscts}"
+        f"parity={args.parity}, rtscts={use_rtscts}",
+        flush=True,
     )
     if args.speed is not None:
-        print(f"Replay speed: {speed_ctrl.current():.2f}x (CLI override)")
+        print(f"Replay speed: {speed_ctrl.current():.2f}x (CLI override)", flush=True)
     else:
         print(
-            f"Replay speed: {speed_ctrl.current():.2f}x (from {config_path})"
+            f"Replay speed: {speed_ctrl.current():.2f}x (from {config_path})",
+            flush=True,
         )
 
     try:
@@ -571,9 +614,13 @@ def main():
         ) as ser:
             if args.wait_command:
                 wait_for_any_command(ser)
-                poll_wave_requests(ser, wave_state)
+                if not args.simulation_mode:
+                    poll_wave_requests(ser, wave_state)
 
             while True:
+                if stop_event.is_set():
+                    print("Stop requested by control port", flush=True)
+                    break
                 replay_once(
                     ser,
                     records,
@@ -581,18 +628,27 @@ def main():
                     speed_ctrl,
                     args.interval,
                     wave_state,
+                    stop_event,
+                    metrics,
+                    simulation_mode=args.simulation_mode,
                 )
+                if stop_event.is_set():
+                    print("Stop requested by control port", flush=True)
+                    break
                 if not args.loop:
                     break
-                print("Loop enabled: restarting replay in 1 second...")
+                print("Loop enabled: restarting replay in 1 second...", flush=True)
                 time.sleep(1)
     except SerialException as exc:
-        print(f"ERROR: unable to open serial port {args.port}: {exc}")
+        print(f"ERROR: unable to open serial port {args.port}: {exc}", flush=True)
         print(
             "Hint: another process is likely using this COM port. Stop "
-            "the other simulator/collector instance or choose another port."
+            "the other simulator/collector instance or choose another port.",
+            flush=True,
         )
         raise SystemExit(2)
+    finally:
+        control.stop()
 
 
 if __name__ == "__main__":

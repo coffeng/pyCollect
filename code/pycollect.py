@@ -617,6 +617,23 @@ def main():
         help="Mirror Qt GUI log lines to stdout for debugging.",
     )
     parser.add_argument(
+        "--baud",
+        type=int,
+        default=None,
+        help="Override serial baud rate for Qt GUI (19200 or 115200).",
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=0,
+        help="Optional localhost TCP control port for Qt GUI.",
+    )
+    parser.add_argument(
+        "--no-rtscts",
+        action="store_true",
+        help="Disable RTS/CTS hardware flow control for Qt GUI.",
+    )
+    parser.add_argument(
         "--config",
         default="config/pycollect_gui_config.json",
         help="Path to JSON config file (for --terminal-simulator mode).",
@@ -640,6 +657,12 @@ def main():
             command.extend(["--duration", str(args.duration)])
         if args.debug_stdout:
             command.append("--debug-stdout")
+        if args.baud and args.baud in (19200, 115200):
+            command.extend(["--baud", str(args.baud)])
+        if args.control_port and args.control_port > 0:
+            command.extend(["--control-port", str(args.control_port)])
+        if args.no_rtscts:
+            command.append("--no-rtscts")
         subprocess.run(command, check=False)
         return
 

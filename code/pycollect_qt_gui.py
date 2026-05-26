@@ -15,6 +15,7 @@ from PyQt5 import QtCore, QtWidgets
 from serial.tools import list_ports
 
 import drc_2_csv
+from local_control import LocalControlServer
 import pycollect
 
 
@@ -360,6 +361,7 @@ class CollectorWorker(QtCore.QThread):
         baudrate=19200,
         output_name="",
         simulation_mode=False,
+        no_rtscts=False,
         parent=None,
     ):
         super().__init__(parent)
@@ -376,6 +378,7 @@ class CollectorWorker(QtCore.QThread):
         )
         self.output_name = output_name
         self.simulation_mode = bool(simulation_mode)
+        self.no_rtscts = bool(no_rtscts)
         self._stop_requested = False
         self.all_wave_by_type = {
             item["sr_type"]: item
@@ -568,6 +571,7 @@ class CollectorWorker(QtCore.QThread):
     def _extract_waves(self, payload):
         out = {}
         positive_rows = set()
+        present_rows = set()
         valid_indices = [
             idx
             for idx, item in enumerate(payload["sr_types"])
@@ -578,10 +582,6 @@ class CollectorWorker(QtCore.QThread):
 
         for pos, idx in enumerate(valid_indices):
             sr_type = payload["sr_types"][idx]
-            chan_id = self.selected_wave_types.get(sr_type)
-            if not chan_id or chan_id in out:
-                continue
-
             start = payload["raw_offsets"][idx] + 6
             if pos < len(valid_indices) - 1:
                 end = payload["raw_offsets"][valid_indices[pos + 1]]
@@ -611,16 +611,25 @@ class CollectorWorker(QtCore.QThread):
                 for sample in raw_samples
             ]
 
+            # Track waveform availability from incoming stream regardless of
+            # current GUI selection, so selector/header reflect actual data.
+            if wave_meta is not None and len(scaled_samples) > 0:
+                present_rows.add(wave_meta["row_identifier"])
+
             if (
                 wave_meta is not None
-                and any(sample > 0 for sample in scaled_samples)
+                and any(abs(sample) > 1e-9 for sample in scaled_samples)
             ):
                 positive_rows.add(wave_meta["row_identifier"])
+
+            chan_id = self.selected_wave_types.get(sr_type)
+            if not chan_id or chan_id in out:
+                continue
 
             if chan_id and chan_id not in out:
                 out[chan_id] = scaled_samples
 
-        return out, positive_rows
+        return out, positive_rows, present_rows
 
     def _extract_from_record(self, record_data):
         if len(record_data) < 40:
@@ -686,16 +695,18 @@ class CollectorWorker(QtCore.QThread):
                 "waves": {},
                 "positive_trend_rows": list(positive_trend_rows),
                 "positive_wave_rows": [],
+                "present_wave_rows": [],
                 "record_time_unix": int(r_time),
             }
         if r_maintype == 1:
-            waves, positive_wave_rows = self._extract_waves(parsed)
+            waves, positive_wave_rows, present_wave_rows = self._extract_waves(parsed)
             return {
                 "trends": {},
                 "trend_rows": {},
                 "waves": waves,
                 "positive_trend_rows": [],
                 "positive_wave_rows": list(positive_wave_rows),
+                "present_wave_rows": list(present_wave_rows),
                 "record_time_unix": int(r_time),
             }
         return {
@@ -704,6 +715,7 @@ class CollectorWorker(QtCore.QThread):
             "waves": {},
             "positive_trend_rows": [],
             "positive_wave_rows": [],
+            "present_wave_rows": [],
             "record_time_unix": int(r_time),
         }
 
@@ -725,7 +737,7 @@ class CollectorWorker(QtCore.QThread):
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_EVEN,
                 stopbits=serial.STOPBITS_ONE,
-                rtscts=True,
+                rtscts=(not self.no_rtscts),
             )
 
             self.status_signal.emit(
@@ -918,6 +930,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         simulation_mode=False,
         initial_duration=None,
         debug_stdout=False,
+        control_port=0,
+        no_rtscts=False,
     ):
         super().__init__()
         self.setWindowTitle("pyCollect Interactive Viewer")
@@ -932,6 +946,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.autostart = autostart
         self.simulation_mode = simulation_mode
         self.debug_stdout = debug_stdout
+        self.control_port = int(control_port or 0)
+        self.no_rtscts = bool(no_rtscts)
         self._is_closing = False
         self.trend_defs = config["trend_defs"]
         self.wave_defs = config["wave_defs"]
@@ -951,6 +967,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.last_record_header_utc = None
         self.wave_last_seen_monotonic = {}
         self.wave_last_seen_by_row = {}  # Track all waveforms for header
+        self._last_logged_available_waves = None
         self.current_output_file = ""
         self.current_file_state = "default"
         self.csv_worker = None
@@ -1023,6 +1040,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # Build initial graph panels from loaded selections.
         self._rebuild_trend_plots()
         self._rebuild_wave_plots()
+
+        self.control_server = LocalControlServer(
+            name="gui",
+            port=self.control_port,
+            on_stop=self._on_control_stop,
+            on_status=self._on_control_status,
+            logger=self.log,
+        )
+        self.control_server.start()
 
     def _cfg_color(self, section, key, fallback):
         section_data = self.colors.get(section, {})
@@ -1116,10 +1142,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 or "#ffffff"
             )
         elif state == "yellow":
+            # Yellow for "waiting/pending" - waveform selected but no data yet
             bg = (
                 _pick_color(state_cfg, "bg")
                 or status.get("warning")
-                or "#f0c419"
+                or "#ffa500"  # Orange for waiting
             )
             fg = _pick_color(state_cfg, "text") or "#1a1a1a"
         elif state == "red":
@@ -1644,11 +1671,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.signal_section = CollapsibleSection("Trends Selection", expanded=True)
         left.addWidget(self.signal_section)
+        # Trends hint text
+        trends_hint_text = (
+            "Legend: blue\u00a0=\u00a0has data, green\u00a0=\u00a0selected+data, "
+            "light\u00a0green\u00a0=\u00a0selected+no\u00a0data."
+        )
         self.signal_section.content_layout.addWidget(
-            _hint(
-                "Legend: blue\u00a0=\u00a0has data, green\u00a0=\u00a0selected+data, "
-                "light\u00a0green\u00a0=\u00a0selected+no\u00a0data."
-            )
+            _hint(trends_hint_text)
         )
         trend_search = QtWidgets.QLineEdit()
         trend_search.setPlaceholderText("Filter trends…")
@@ -1719,11 +1748,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             left.indexOf(self.signal_section),
             self.wave_catalog_section,
         )
-        self.wave_catalog_section.content_layout.addWidget(
-            _hint(
+        # Hint text changes based on mode
+        if self.simulation_mode:
+            hint_text = (
+                "Legend: green = selected + receiving, "
+                "blue = receiving but not selected, "
+                "yellow = selected but waiting for data."
+            )
+        else:
+            hint_text = (
                 "Legend: green receiving, yellow delayed, red missing, "
                 "blue pending request."
             )
+        self.wave_catalog_section.content_layout.addWidget(
+            _hint(hint_text)
         )
         wave_search = QtWidgets.QLineEdit()
         wave_search.setPlaceholderText("Filter waveforms…")
@@ -2182,6 +2220,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             baudrate=baudrate,
             output_name=self.output_name,
             simulation_mode=self.simulation_mode,
+            no_rtscts=self.no_rtscts,
         )
         self.worker.update_requested_wave_rows(self.wave_requested_rows)
         self.worker.package_signal.connect(self.on_package)
@@ -2221,6 +2260,40 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.worker.request_stop()
             self.log("Stop requested")
 
+    def _on_control_stop(self):
+        # Marshal control-thread requests to the Qt main thread.
+        QtCore.QTimer.singleShot(0, self._apply_control_stop)
+        return "stopping gui"
+
+    def _apply_control_stop(self):
+        self.log("Remote stop requested")
+        self.stop_capture()
+        self._close_after_remote_stop(deadline=time.monotonic() + 5.0)
+
+    def _close_after_remote_stop(self, deadline):
+        if self.worker is not None and self.worker.isRunning():
+            if time.monotonic() >= deadline:
+                self.log("Remote stop timeout reached; closing window")
+                self.close()
+                return
+            QtCore.QTimer.singleShot(
+                150,
+                lambda: self._close_after_remote_stop(deadline),
+            )
+            return
+        self.close()
+
+    def _on_control_status(self):
+        running = bool(
+            self.worker is not None
+            and self.worker.isRunning()
+        )
+        return (
+            f"running={running} "
+            f"port={self.port_combo.currentText()} "
+            f"baud={self.baud_combo.currentText()}"
+        )
+
     def on_wave_mapping(self, wave_row_ids):
         """Wave graphs are driven by catalog buttons; mapping is informational only."""
         pass
@@ -2244,6 +2317,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         waves = payload.get("waves", {})
         positive_trend_rows = payload.get("positive_trend_rows", [])
         positive_wave_rows = payload.get("positive_wave_rows", [])
+        present_wave_rows = payload.get("present_wave_rows", [])
 
         prev_trend_count = len(self.positive_trend_rows)
         prev_wave_count = len(self.positive_wave_rows)
@@ -2259,6 +2333,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # Update wave request catalog: any row that produced positive samples
         # is timestamped, and displayed rows are auto-requested.
         now_mono = time.monotonic()
+        for row_id in present_wave_rows:
+            self.wave_last_seen_by_row[int(row_id)] = now_mono
+
         displayed_rows = self._displayed_wave_row_ids()
         for row_id in positive_wave_rows:
             row_id = int(row_id)
@@ -2356,20 +2433,43 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             int(item["row_identifier"]): item["label"]
             for item in self.all_wave_defs
         }
-        for row_id in sorted(self.wave_last_seen_by_row.keys()):
-            last_seen = self.wave_last_seen_by_row.get(row_id)
-            if last_seen is None:
-                continue
-            if (now_mono - last_seen) <= 5.0:
-                label = row_to_label.get(row_id)
-                if label:
-                    recent_wave_labels.append(label)
+        
+        # In simulation mode, show only waveforms currently receiving data
+        # (not based on selections).
+        if self.simulation_mode:
+            for row_id in sorted(self.wave_last_seen_by_row.keys()):
+                last_seen = self.wave_last_seen_by_row.get(row_id)
+                if last_seen is None:
+                    continue
+                if (now_mono - float(last_seen)) <= self.WAVE_REQUEST_TIMEOUT_SEC:
+                    label = row_to_label.get(row_id)
+                    if label:
+                        recent_wave_labels.append(label)
+        else:
+            # In real monitor mode, show recently active waveforms (last 5s)
+            for row_id in sorted(self.wave_last_seen_by_row.keys()):
+                last_seen = self.wave_last_seen_by_row.get(row_id)
+                if last_seen is None:
+                    continue
+                if (now_mono - last_seen) <= 5.0:
+                    label = row_to_label.get(row_id)
+                    if label:
+                        recent_wave_labels.append(label)
 
         if recent_wave_labels:
             text = ", ".join(recent_wave_labels)
         else:
             text = "none"
-        self.recent_waves_label.setText(f"Waveforms (last 5s): {text}")
+        
+        # Update header label based on mode
+        if self.simulation_mode:
+            header_text = f"Waveforms (available): {text}"
+            self.recent_waves_label.setText(header_text)
+            if self.debug_stdout and text != self._last_logged_available_waves:
+                self.log(header_text)
+                self._last_logged_available_waves = text
+        else:
+            self.recent_waves_label.setText(f"Waveforms (last 5s): {text}")
 
     @staticmethod
     def _build_wrapped_series(points, window_sec, now_sec, gap_sec=1.0):
@@ -2502,6 +2602,25 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _wave_request_button_state(self, row_id):
         requested = row_id in self.wave_requested_rows
+        last_seen_any = self.wave_last_seen_by_row.get(row_id)
+        has_data = (
+            last_seen_any is not None
+            and (time.monotonic() - float(last_seen_any))
+            <= self.WAVE_REQUEST_TIMEOUT_SEC
+        )
+        
+        # In simulation mode, use simpler logic: green/blue/yellow based on selection + data
+        if self.simulation_mode:
+            if requested and has_data:
+                return "green"      # selected AND has data
+            elif not requested and has_data:
+                return "blue"       # has data but NOT selected
+            elif requested and not has_data:
+                return "yellow"     # selected but NO data yet (pending/waiting)
+            else:
+                return "default"    # not selected, no data
+        
+        # Original logic for non-simulation mode
         last_rx = self.wave_last_received_at.get(row_id)
         if last_rx is None:
             age = None
@@ -2559,7 +2678,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         row_id = int(row_id)
         displayed = self._displayed_wave_row_ids()
         appending = self._is_actively_appending()
-        if row_id in displayed and not checked and appending:
+        if (
+            (not self.simulation_mode)
+            and row_id in displayed
+            and not checked
+            and appending
+        ):
             state = self._wave_request_button_state(row_id)
             if state != "red":
                 # Keep displayed rows selected while actively receiving.
@@ -2644,6 +2768,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.sim_idle_timer.stop()
         except Exception:
             pass
+        try:
+            self.control_server.stop()
+        except Exception:
+            pass
         self._save_runtime_config()
         super().closeEvent(event)
 
@@ -2689,6 +2817,23 @@ def main():
         action="store_true",
         help="Mirror Qt GUI log lines to stdout for debugging.",
     )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=0,
+        help="Optional localhost TCP control port (supports: ping,status,stop).",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=None,
+        help="Override serial baud rate (19200 or 115200).",
+    )
+    parser.add_argument(
+        "--no-rtscts",
+        action="store_true",
+        help="Disable RTS/CTS hardware flow control.",
+    )
     args = parser.parse_args()
 
     base_dir = _get_config_dir()
@@ -2699,6 +2844,9 @@ def main():
     except Exception as exc:
         print(f"Failed to load signal config: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if args.baud is not None and args.baud in (19200, 115200):
+        config["initial_baudrate"] = args.baud
 
     app = QtWidgets.QApplication(sys.argv)
     pg.setConfigOptions(antialias=True)
@@ -2716,6 +2864,8 @@ def main():
         simulation_mode=args.simulation_mode,
         initial_duration=max(5, int(initial_duration)),
         debug_stdout=args.debug_stdout,
+        control_port=args.control_port,
+        no_rtscts=args.no_rtscts,
     )
     win.show()
     win.raise_()

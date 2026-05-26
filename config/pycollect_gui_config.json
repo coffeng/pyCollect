@@ -72,9 +72,9 @@
     }
   },
   "ui": {
-    "duration_sec": 30,
-    "trend_window_sec": 45,
-    "wave_window_sec": 300.0,
+    "duration_sec": 3600,
+    "trend_window_sec": 60,
+    "wave_window_sec": 30.0,
     "trend_interval_sec": 120,
     "section_locks": {
       "monitor_connection": false,
@@ -82,7 +82,7 @@
       "monitoring_control": false
     },
     "connection": {
-      "baudrate": 19200
+      "baudrate": 115200
     },
     "simulator": {
       "speed_multiplier": 20.0
@@ -109,11 +109,20 @@
       },
       {
         "row_identifier": 1
+      },
+      {
+        "row_identifier": 2
+      },
+      {
+        "row_identifier": 158
       }
     ],
     "waves": [
       {
-        "row_identifier": 10
+        "row_identifier": 1
+      },
+      {
+        "row_identifier": 4
       },
       {
         "row_identifier": 13

@@ -2,6 +2,50 @@
 
 This document started as a plan and now also tracks implemented/tested status for the current prototype.
 
+## Update: 2026-05-26
+
+Today the simulator and Qt GUI integration was tightened up for the serial-loop
+workflow used in option 3.
+
+- Added localhost control servers so the simulator and GUI can be queried and
+  stopped cleanly from PowerShell or other local scripts.
+- Added dedicated option-3 launcher flow on Windows via `run_option3.ps1`.
+- Updated simulation mode so the simulator sends the DRC data as-is instead of
+  filtering outgoing waveforms to match the current GUI request set.
+- Updated simulation-mode waveform catalog colors in the GUI:
+  - green = selected and currently receiving data
+  - blue = currently receiving data but not selected
+  - yellow/orange = selected but waiting for data
+- Updated the top waveform header in simulation mode so it lists waveforms that
+  are actually present in incoming packets, not merely waveforms selected in the
+  GUI.
+- Verified that simulation-mode catalog buttons can be unselected during active
+  capture and that `Paw` appears in the live header when it is present in the
+  incoming simulator stream.
+
+### Localhost Control Ports
+
+- Simulator control server: `127.0.0.1:9031`
+- GUI control server: `127.0.0.1:9032`
+- Supported commands: `ping`, `status`, `stop`
+
+PowerShell helper:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\send_control.ps1 -Target sim -Command status
+powershell -NoProfile -ExecutionPolicy Bypass -File .\send_control.ps1 -Target gui -Command stop
+```
+
+### Option 3 Notes
+
+- `run_pycollect.bat 3` now uses `run_option3.ps1`.
+- The simulator is started with `--simulation-mode`, `--no-rtscts`, and
+  `--max-records 0` so each loop completes the entire DRC file before
+  restarting.
+- Verified on the current setup that option 3 receives clean packages and that
+  the GUI header reports `ECG1, P1, Paw, Flow` when those waveforms are present
+  in the simulator stream.
+
 ## Goal
 
 Create a Python package and desktop application that:
@@ -78,6 +122,7 @@ pyCollect/
 ├── drc_monitor_simulator.py              # Replays DRC as simulated monitor stream
 ├── serial_bridge.py                      # Serial port forwarding tool
 ├── drc_2_csv.py                          # DRC-to-CSV converter library
+├── local_control.py                      # Localhost control server used by simulator and GUI
 ├── pycollect_qt_gui.py                   # PyQt5 GUI implementation (imported by others)
 │
 ├── CONFIGURATION FILES
@@ -89,6 +134,12 @@ pyCollect/
 ├── test_pycollect_simulator_5_records.py # Unit test: pycollect library with simulator
 ├── ui_sidebar_smoke_test.py              # Qt GUI smoke test: sidebar widgets
 ├── ui_waveform_catalog_smoke_test.py     # Qt GUI smoke test: waveform catalog state machine
+├── tests/serial_loopback_test.py         # Serial loopback validation for COM bridge path
+├── tests/sim_gui_diag.py                 # Headless simulator-to-GUI packet diagnostic
+
+├── CONTROL / LAUNCHER HELPERS
+├── run_option3.ps1                       # Windows option-3 launcher with graceful cleanup
+├── send_control.ps1                      # PowerShell client for localhost control ports
 │
 └── TEST DATA (Generated or Imported)
     └── (Example files, not in git; generated at runtime)
@@ -682,8 +733,23 @@ re-verified during future regression checks.
   to Qt GUI mode.
 18. Qt GUI supports a Waveform Request Catalog section with per-row request
   toggles and state-driven button coloring (blue/green/yellow/red/default).
-19. Displayed wave rows are protected from being unrequested in the catalog.
-20. Qt GUI log can mirror to stdout when `--debug-stdout` is enabled.
+19. Localhost control servers support `ping`, `status`, and `stop` on
+  `127.0.0.1:9031` (simulator) and `127.0.0.1:9032` (GUI).
+20. Windows option 3 uses `run_option3.ps1` to launch simulator + GUI and stop
+  the simulator cleanly after the GUI exits.
+21. Simulation mode in `drc_monitor_simulator.py` can send the DRC stream
+  without outgoing waveform filtering so the GUI can adjust wave selections
+  independently.
+22. Simulator loop mode can replay the full DRC file and only then restart the
+  loop (`--max-records 0`).
+23. In simulation mode, wave catalog buttons indicate live availability:
+  green=selected+receiving, blue=receiving+not selected,
+  yellow/orange=selected+waiting.
+24. In simulation mode, the waveform header reports waveforms detected in
+  incoming packets rather than only waveforms selected for display.
+25. Displayed wave rows are protected from being unrequested only in the
+  non-simulation path; simulation mode allows live deselection while capturing.
+26. Qt GUI log can mirror to stdout when `--debug-stdout` is enabled.
 
 ### Enumerated Requirements For Future Verification
 
@@ -826,9 +892,18 @@ pyCollect/
   red=requested+timed-out,
   yellow=not requested but receiving,
   default=not requested and stale/no data.
-16. Clicking a currently displayed wave row in catalog must keep it requested
-  and log a protection message.
-17. `python pycollect.py --help` and `python pycollect_qt_gui.py --help` must
+16. In simulation mode, wave catalog button state must follow:
+  green=selected+currently receiving,
+  blue=currently receiving but not selected,
+  yellow/orange=selected but waiting for data,
+  default=not selected and not currently receiving.
+17. In simulation mode, clicking a currently displayed wave row in the catalog
+  must allow deselection while capture is active.
+18. In non-simulation mode, clicking a currently displayed wave row in catalog
+  must keep it requested and log a protection message.
+19. The simulation-mode header must list waveforms actually present in recent
+  incoming packets, including unselected rows such as `Paw` when present.
+20. `python pycollect.py --help` and `python pycollect_qt_gui.py --help` must
   show `--debug-stdout`; GUI log lines must be mirrored to stdout when used.
 
 
