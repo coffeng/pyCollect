@@ -1633,7 +1633,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             _hint("Start to begin bedside recording.")
         )
 
-        self.signal_section = CollapsibleSection("Signal Setup", expanded=True)
+        self.signal_section = CollapsibleSection("Trends Selection", expanded=True)
         left.addWidget(self.signal_section)
         self.signal_section.content_layout.addWidget(
             _hint(
@@ -1641,6 +1641,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 "light\u00a0green\u00a0=\u00a0selected+no\u00a0data."
             )
         )
+        trend_search = QtWidgets.QLineEdit()
+        trend_search.setPlaceholderText("Filter trends…")
+        trend_search.setClearButtonEnabled(True)
+        self.signal_section.content_layout.addWidget(trend_search)
+
         trend_catalog_scroll = QtWidgets.QScrollArea()
         trend_catalog_scroll.setWidgetResizable(True)
         trend_catalog_scroll.setHorizontalScrollBarPolicy(
@@ -1653,6 +1658,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         trend_catalog_grid.setContentsMargins(0, 0, 0, 0)
         trend_catalog_grid.setHorizontalSpacing(4)
         trend_catalog_grid.setVerticalSpacing(4)
+        self._trend_catalog_grid = trend_catalog_grid
+        self._trend_catalog_items = []
 
         _trend_cols = 3
         _selected_trend_rows = {int(d["row_identifier"]) for d in self.trend_defs}
@@ -1675,12 +1682,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 )
             )
             self.trend_catalog_buttons[row_id] = btn
+            self._trend_catalog_items.append((row_id, label, btn))
             trend_catalog_grid.addWidget(
                 btn, idx // _trend_cols, idx % _trend_cols
             )
 
         trend_catalog_scroll.setWidget(trend_catalog_inner)
         self.signal_section.content_layout.addWidget(trend_catalog_scroll)
+        trend_search.textChanged.connect(self._filter_trend_catalog)
 
         self.status_section = CollapsibleSection("Recorder Output", expanded=True)
         left.addWidget(self.status_section)
@@ -1698,7 +1707,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             expanded=False,
         )
         left.insertWidget(
-            left.indexOf(self.view_section),
+            left.indexOf(self.signal_section),
             self.wave_catalog_section,
         )
         self.wave_catalog_section.content_layout.addWidget(
@@ -1707,6 +1716,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 "blue pending request."
             )
         )
+        wave_search = QtWidgets.QLineEdit()
+        wave_search.setPlaceholderText("Filter waveforms…")
+        wave_search.setClearButtonEnabled(True)
+        self.wave_catalog_section.content_layout.addWidget(wave_search)
+
         catalog_scroll = QtWidgets.QScrollArea()
         catalog_scroll.setWidgetResizable(True)
         catalog_scroll.setHorizontalScrollBarPolicy(
@@ -1719,6 +1733,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         catalog_grid.setContentsMargins(0, 0, 0, 0)
         catalog_grid.setHorizontalSpacing(4)
         catalog_grid.setVerticalSpacing(4)
+        self._wave_catalog_grid = catalog_grid
+        self._wave_catalog_items = []
 
         cols = 3
         for idx, item in enumerate(self.all_wave_defs):
@@ -1740,10 +1756,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 )
             )
             self.wave_request_buttons[row_id] = btn
+            self._wave_catalog_items.append((row_id, label, btn))
             catalog_grid.addWidget(btn, idx // cols, idx % cols)
 
         catalog_scroll.setWidget(catalog_inner)
         self.wave_catalog_section.content_layout.addWidget(catalog_scroll)
+        wave_search.textChanged.connect(self._filter_wave_catalog)
 
         self.advanced_section = CollapsibleSection("Advanced", expanded=False)
         left.addWidget(self.advanced_section)
@@ -1907,6 +1925,42 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
         for row_id in list(self.trend_catalog_buttons.keys()):
             self._apply_trend_button_style(row_id)
+
+    def _filter_trend_catalog(self, text):
+        """Show only trend buttons whose label contains *text*; reflow grid."""
+        query = text.strip().lower()
+        grid = self._trend_catalog_grid
+        for _, _, btn in self._trend_catalog_items:
+            grid.removeWidget(btn)
+        col = row_idx = 0
+        for _rid, label, btn in self._trend_catalog_items:
+            if query and query not in label.lower():
+                btn.setVisible(False)
+            else:
+                btn.setVisible(True)
+                grid.addWidget(btn, row_idx, col)
+                col += 1
+                if col >= 3:
+                    col = 0
+                    row_idx += 1
+
+    def _filter_wave_catalog(self, text):
+        """Show only wave buttons whose label contains *text*; reflow grid."""
+        query = text.strip().lower()
+        grid = self._wave_catalog_grid
+        for _, _, btn in self._wave_catalog_items:
+            grid.removeWidget(btn)
+        col = row_idx = 0
+        for _rid, label, btn in self._wave_catalog_items:
+            if query and query not in label.lower():
+                btn.setVisible(False)
+            else:
+                btn.setVisible(True)
+                grid.addWidget(btn, row_idx, col)
+                col += 1
+                if col >= 3:
+                    col = 0
+                    row_idx += 1
 
     # --- Graph panel rebuilding ------------------------------------------
 
