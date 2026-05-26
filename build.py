@@ -121,6 +121,8 @@ def _build_exe(has_icon: bool) -> bool:
         f"--name={APP_NAME}",
         # Bundle config directory so the frozen app can find signal definitions
         "--add-data=config;config",
+        # Bundle assets so Qt can set window/taskbar icon in frozen mode
+        "--add-data=assets;assets",
         # Bundle icon preview for potential future splash use
         f"--version-file={VERSION_FILE}",
         # PyQt5 / pyqtgraph imports

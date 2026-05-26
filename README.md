@@ -95,6 +95,26 @@ Create a Python package and desktop application that:
   - Online and offline visualization concepts.
   - Export/conversion workflows.
 
+### Protocol Reference (Computer Interface Spec)
+
+- Source document: `C:\Users\100014430\Box\iCollect 5.x\Design Documentation\Software Design\M1017617_13th_S5_Computer_interface_spec.pdf`
+- Purpose: GE S/5 serial computer interface protocol reference for command and payload behavior (including alarms).
+
+#### Alarm Request Mapping Used In Code
+
+- Protocol section: **Access to alarm information** (M1017617, chapter 5).
+- Alarm request command values implemented in `code/pycollect_qt_gui.py`:
+  - `DRI_AL_XMIT_STATUS = 0`
+  - `DRI_AL_ENTER_DIFFMODE = 2`
+  - `DRI_AL_EXIT_DIFFMODE = 3`
+- Config keys supported for protocol alarm request frames:
+  - `protocol.commands.alarm_xmit_status_hex`
+  - `protocol.commands.alarm_enter_diffmode_hex`
+  - `protocol.commands.alarm_exit_diffmode_hex`
+  - Backward-compatible fallback:
+    - `protocol.commands.alarm_start_hex`
+    - `protocol.commands.alarm_stop_hex`
+
 ## Target Scope (What This Project Should Deliver)
 
 1. Python package for serial capture and DRC handling.

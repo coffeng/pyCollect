@@ -5,7 +5,7 @@ a = Analysis(
     ['C:\\Users\\100014430\\Documents\\GitHub\\Enterprise\\pyCollect\\code\\pycollect.py'],
     pathex=[],
     binaries=[],
-    datas=[('config', 'config')],
+    datas=[('config', 'config'), ('assets', 'assets')],
     hiddenimports=['PyQt5.sip', 'PyQt5.QtCore', 'PyQt5.QtWidgets', 'PyQt5.QtGui', 'pyqtgraph', 'serial', 'serial.tools', 'serial.tools.list_ports'],
     hookspath=[],
     hooksconfig={},

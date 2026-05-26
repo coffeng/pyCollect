@@ -9,12 +9,13 @@ set "SIM_PORT=COM4"
 set "GUI_PORT=COM2"
 set "SIM_CTRL_PORT=9031"
 set "GUI_CTRL_PORT=9032"
-set "RUNTIME=%PYCOLLECT_RUNTIME%"
+set "RUNTIME=%~2"
 
-if "%RUNTIME%"=="" set "RUNTIME=python"
-if /I not "%RUNTIME%"=="python" if /I not "%RUNTIME%"=="exe" (
-echo ERROR: invalid PYCOLLECT_RUNTIME value "%RUNTIME%".
-echo Valid values are: python, exe
+if "%RUNTIME%"=="" set "RUNTIME=py"
+if /I "%RUNTIME%"=="python" set "RUNTIME=py"
+if /I not "%RUNTIME%"=="py" if /I not "%RUNTIME%"=="exe" (
+echo ERROR: invalid runtime "%RUNTIME%".
+echo Valid runtime values are: py, exe
 exit /b 2
 )
 
@@ -111,18 +112,22 @@ echo Runtime mode: %RUNTIME%
 
 echo.
 echo Usage:
-echo   run_pycollect.bat 1
-echo   run_pycollect.bat 2
-echo   run_pycollect.bat 3
-echo   run_pycollect.bat 4
-echo   run_pycollect.bat 5
-echo   run_pycollect.bat 6
+echo   run_pycollect.bat 1 [py^|exe]
+echo   run_pycollect.bat 2 [py^|exe]
+echo   run_pycollect.bat 3 [py^|exe]
+echo   run_pycollect.bat 4 [py^|exe]
+echo   run_pycollect.bat 5 [py^|exe]
+echo   run_pycollect.bat 6 [py^|exe]
 echo   run_pycollect.bat help
 
 echo.
-echo Optional environment variable:
-echo   set PYCOLLECT_RUNTIME=python   ^(default^)
-echo   set PYCOLLECT_RUNTIME=exe      ^(use dist\pyCollect.exe for options 2/3/5^)
+echo Runtime argument:
+echo   py   ^(default; run with .venv\Scripts\python.exe^)
+echo   exe  ^(use dist\pyCollect.exe for options 2/3/5^)
+echo.
+echo Examples:
+echo   run_pycollect.bat 3
+echo   run_pycollect.bat 3 exe
 
 echo.
 echo Options:

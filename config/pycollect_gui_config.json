@@ -3,6 +3,12 @@
     "params_file": "params5.txt",
     "waves_file": "waves5.txt"
   },
+  "protocol": {
+    "commands": {
+      "alarm_start_hex": "7E31 0000 00E8 FD25 0407 6700 0000 0000 0000 0000 0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 0001 0A00 0800 0000 0000 BF7E",
+      "alarm_stop_hex": "7E31 0000 00E8 FD33 0607 6700 0000 0000 0000 0000 0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 0001 0000 0800 0000 0000 C57E"
+    }
+  },
   "user_role": "Administrator",
   "colors": {
     "theme": "dark_medical",
@@ -72,7 +78,7 @@
     }
   },
   "ui": {
-    "duration_sec": 3600,
+    "duration_sec": 60,
     "trend_window_sec": 60,
     "wave_window_sec": 30.0,
     "trend_interval_sec": 120,
@@ -82,7 +88,7 @@
       "monitoring_control": false
     },
     "connection": {
-      "baudrate": 115200
+      "baudrate": 19200
     },
     "simulator": {
       "speed_multiplier": 20.0
@@ -123,6 +129,9 @@
       },
       {
         "row_identifier": 4
+      },
+      {
+        "row_identifier": 9
       },
       {
         "row_identifier": 13

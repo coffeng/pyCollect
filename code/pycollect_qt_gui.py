@@ -1,17 +1,21 @@
 import argparse
+import ctypes
 import json
 import math
+import os
+import re
 import struct
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyqtgraph as pg
 import serial
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 from serial.tools import list_ports
 
 import drc_2_csv
@@ -36,6 +40,12 @@ START_WAVES_HEX = (
     "0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 "
     "0000 0000 0000 0000 0000 0045 7E"
 )
+
+# S/5 Computer Interface Spec (M1017617), alarm request command values:
+# DRI_AL_XMIT_STATUS=0, DRI_AL_ENTER_DIFFMODE=2, DRI_AL_EXIT_DIFFMODE=3.
+ALARM_CMD_XMIT_STATUS = 0
+ALARM_CMD_ENTER_DIFFMODE = 2
+ALARM_CMD_EXIT_DIFFMODE = 3
 STOP_WAVES_HEX = (
     "7E58 0000 00E8 FD35 2808 6700 0000 0001 0000 0000 "
     "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
@@ -47,13 +57,141 @@ STOP_WAVES_HEX = (
 DEFAULT_CONFIG = "pycollect_gui_config.json"
 
 
-def _get_config_dir() -> Path:
-    """Return the config/ directory for both script and PyInstaller bundle modes."""
+def _startup_log_path() -> Path:
+    base_dir = Path(__file__).resolve().parent.parent
     if getattr(sys, "frozen", False):
-        # PyInstaller one-file bundle: config data landed under _MEIPASS/config
-        return Path(sys._MEIPASS) / "config"  # type: ignore[attr-defined]
-    # Normal script mode: config/ is one level above code/
-    return Path(__file__).resolve().parent.parent / "config"
+        base_dir = Path(sys.executable).resolve().parent
+    out_dir = base_dir / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / "pycollect_qt_gui_startup.log"
+
+
+def _startup_log(message: str) -> None:
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _startup_log_path().open("a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
+
+
+def _runtime_search_roots():
+    roots = []
+
+    if getattr(sys, "frozen", False):
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            local_root = Path(local_appdata) / "pyCollect"
+            roots.append(local_root)
+            roots.append(local_root / "config")
+
+        exe_dir = Path(sys.executable).resolve().parent
+        roots.append(exe_dir)
+        roots.append(exe_dir / "config")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass).resolve())
+            roots.append((Path(meipass).resolve() / "config"))
+        roots.append(Path.cwd().resolve())
+    else:
+        roots.append(Path.cwd().resolve())
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            local_root = Path(local_appdata) / "pyCollect"
+            roots.append(local_root)
+            roots.append(local_root / "config")
+        repo_root = Path(__file__).resolve().parent.parent
+        roots.append(repo_root)
+        roots.append(repo_root / "config")
+
+    uniq = []
+    seen = set()
+    for root in roots:
+        key = str(root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(root)
+    return uniq
+
+
+def _resolve_config_path(config_path=""):
+    requested = str(config_path or "").strip()
+    if requested:
+        p = Path(requested)
+        if p.is_absolute() and p.exists():
+            return p.resolve()
+        if p.exists():
+            return p.resolve()
+        for root in _runtime_search_roots():
+            candidate = (root / requested).resolve()
+            if candidate.exists():
+                return candidate
+            if p.name == DEFAULT_CONFIG:
+                fallback = (root / DEFAULT_CONFIG).resolve()
+                if fallback.exists():
+                    return fallback
+        return None
+
+    for root in _runtime_search_roots():
+        candidate = (root / DEFAULT_CONFIG).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _config_candidates(config_path=""):
+    requested = str(config_path or "").strip()
+    candidates = []
+
+    def _add(path):
+        if path is None:
+            return
+        try:
+            p = Path(path).resolve()
+        except Exception:
+            return
+        if not p.exists():
+            return
+        key = str(p).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(p)
+
+    seen = set()
+
+    if requested:
+        requested_path = Path(requested)
+        _add(requested_path)
+        for root in _runtime_search_roots():
+            _add(root / requested)
+            if requested_path.name == DEFAULT_CONFIG:
+                _add(root / DEFAULT_CONFIG)
+    else:
+        for root in _runtime_search_roots():
+            _add(root / DEFAULT_CONFIG)
+
+    return candidates
+
+
+def _resolve_icon_path():
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "icon.ico")
+        candidates.append(exe_dir / "assets" / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass).resolve() / "assets" / "icon.ico")
+    else:
+        repo_root = Path(__file__).resolve().parent.parent
+        candidates.append(repo_root / "assets" / "icon.ico")
+
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 class SignalConfigError(Exception):
@@ -113,26 +251,56 @@ def _compact_label_start(text, max_len=8):
     return cleaned[:max_len]
 
 
-def load_signal_config(base_dir, config_path=None):
-    cfg_path = (
-        Path(config_path)
-        if config_path
-        else (base_dir / DEFAULT_CONFIG)
-    )
-    if not cfg_path.exists():
-        raise SignalConfigError(f"Config file not found: {cfg_path}")
+def load_signal_config(config_path=None):
+    candidates = _config_candidates(config_path or "")
+    if not candidates:
+        searched = "\n  - ".join(str(p / DEFAULT_CONFIG) for p in _runtime_search_roots())
+        raise SignalConfigError(
+            "Config file not found. Looked for:\n  - " + searched
+        )
+    last_error = None
+    for cfg_path in candidates:
+        try:
+            raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            config_dir = cfg_path.parent
 
-    raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            signal_sources = raw_cfg.get("signal_sources", {})
+            params_rel = signal_sources.get("params_file")
+            waves_rel = signal_sources.get("waves_file")
+            if not params_rel or not waves_rel:
+                raise SignalConfigError(
+                    "missing signal_sources.params_file/waves_file"
+                )
 
-    params_rel = raw_cfg["signal_sources"]["params_file"]
-    waves_rel = raw_cfg["signal_sources"]["waves_file"]
-    params_path = (base_dir / params_rel).resolve()
-    waves_path = (base_dir / waves_rel).resolve()
+            params_path = (config_dir / params_rel).resolve()
+            waves_path = (config_dir / waves_rel).resolve()
 
-    if not params_path.exists():
-        raise SignalConfigError(f"params file not found: {params_path}")
-    if not waves_path.exists():
-        raise SignalConfigError(f"waves file not found: {waves_path}")
+            if not params_path.exists() or not waves_path.exists():
+                for root in _runtime_search_roots():
+                    maybe_params = (root / params_rel).resolve()
+                    maybe_waves = (root / waves_rel).resolve()
+                    if not params_path.exists() and maybe_params.exists():
+                        params_path = maybe_params
+                    if not waves_path.exists() and maybe_waves.exists():
+                        waves_path = maybe_waves
+
+            if not params_path.exists():
+                raise SignalConfigError(
+                    f"params file not found: {params_path}"
+                )
+            if not waves_path.exists():
+                raise SignalConfigError(
+                    f"waves file not found: {waves_path}"
+                )
+            break
+        except Exception as exc:
+            last_error = f"{cfg_path}: {exc}"
+            raw_cfg = None
+
+    if raw_cfg is None:
+        raise SignalConfigError(
+            "No valid config found. Last error: " + str(last_error)
+        )
 
     params_rows = _read_tab_rows(params_path)
     waves_rows = _read_tab_rows(waves_path)
@@ -239,6 +407,7 @@ def load_signal_config(base_dir, config_path=None):
 
     return {
         "path": str(cfg_path),
+        "config_dir": str(config_dir),
         "all_trend_defs": all_trend_defs,
         "all_wave_defs": all_wave_defs,
         "trend_defs": trend_defs,
@@ -251,6 +420,7 @@ def load_signal_config(base_dir, config_path=None):
         "initial_split_ratio": max(0.1, min(0.9, initial_split_ratio)),
         "colors": colors,
         "user_role": user_role,
+        "protocol": raw_cfg.get("protocol", {}),
     }
 
 
@@ -362,6 +532,10 @@ class CollectorWorker(QtCore.QThread):
         output_name="",
         simulation_mode=False,
         no_rtscts=False,
+        alarm_start_hex="",
+        alarm_stop_hex="",
+        alarm_start_hex_list=None,
+        alarm_stop_hex_list=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -379,6 +553,18 @@ class CollectorWorker(QtCore.QThread):
         self.output_name = output_name
         self.simulation_mode = bool(simulation_mode)
         self.no_rtscts = bool(no_rtscts)
+        self.alarm_start_hex = str(alarm_start_hex or "").strip()
+        self.alarm_stop_hex = str(alarm_stop_hex or "").strip()
+        self.alarm_start_hex_list = [
+            str(item).strip()
+            for item in (alarm_start_hex_list or [])
+            if str(item).strip()
+        ]
+        self.alarm_stop_hex_list = [
+            str(item).strip()
+            for item in (alarm_stop_hex_list or [])
+            if str(item).strip()
+        ]
         self._stop_requested = False
         self.all_wave_by_type = {
             item["sr_type"]: item
@@ -504,6 +690,35 @@ class CollectorWorker(QtCore.QThread):
             ser.write(bytes(hex_command))
             return
         ser.write(bytes.fromhex(pycollect.stripspaces(hex_command)))
+
+    @staticmethod
+    def _extract_alarm_strings(payload_bytes):
+        chunks = payload_bytes.split(b"\x00")
+        found = []
+        seen = set()
+        for chunk in chunks:
+            if len(chunk) < 5:
+                continue
+            try:
+                text = chunk.decode("latin-1", errors="ignore")
+            except Exception:
+                continue
+            text = " ".join(text.split())
+            if len(text) < 5 or len(text) > 120:
+                continue
+            if re.search(r"[A-Za-z]", text) is None:
+                continue
+            printable = sum(1 for ch in text if 32 <= ord(ch) <= 126)
+            if printable < max(4, int(len(text) * 0.8)):
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(text)
+            if len(found) >= 6:
+                break
+        return found
 
     def _extract_trends(self, payload):
         out = {}
@@ -689,6 +904,7 @@ class CollectorWorker(QtCore.QThread):
             trends, positive_trend_rows, all_trend_rows = (
                 self._extract_trends(parsed)
             )
+            alarms = self._extract_alarm_strings(payload)
             return {
                 "trends": trends,
                 "trend_rows": all_trend_rows,
@@ -696,10 +912,12 @@ class CollectorWorker(QtCore.QThread):
                 "positive_trend_rows": list(positive_trend_rows),
                 "positive_wave_rows": [],
                 "present_wave_rows": [],
+                "alarms": alarms,
                 "record_time_unix": int(r_time),
             }
         if r_maintype == 1:
             waves, positive_wave_rows, present_wave_rows = self._extract_waves(parsed)
+            alarms = self._extract_alarm_strings(payload)
             return {
                 "trends": {},
                 "trend_rows": {},
@@ -707,8 +925,10 @@ class CollectorWorker(QtCore.QThread):
                 "positive_trend_rows": [],
                 "positive_wave_rows": list(positive_wave_rows),
                 "present_wave_rows": list(present_wave_rows),
+                "alarms": alarms,
                 "record_time_unix": int(r_time),
             }
+        alarms = self._extract_alarm_strings(payload)
         return {
             "trends": {},
             "trend_rows": {},
@@ -716,6 +936,7 @@ class CollectorWorker(QtCore.QThread):
             "positive_trend_rows": [],
             "positive_wave_rows": [],
             "present_wave_rows": [],
+            "alarms": alarms,
             "record_time_unix": int(r_time),
         }
 
@@ -744,6 +965,15 @@ class CollectorWorker(QtCore.QThread):
                 f"Connected to {self.port} @ {self.baudrate}"
             )
             self._send(ser, START_PARAM_HEX)
+            alarm_start_frames = list(self.alarm_start_hex_list)
+            if not alarm_start_frames and self.alarm_start_hex:
+                alarm_start_frames = [self.alarm_start_hex]
+            for frame in alarm_start_frames:
+                self._send(ser, frame)
+            if alarm_start_frames:
+                self.status_signal.emit(
+                    f"Alarm request sent ({len(alarm_start_frames)} frame(s))"
+                )
             initial_rows = self._consume_wave_request_rows(force=True) or []
             self._send(
                 ser,
@@ -800,6 +1030,11 @@ class CollectorWorker(QtCore.QThread):
                     time.sleep(1)
 
             self._send(ser, STOP_PARAM_HEX)
+            alarm_stop_frames = list(self.alarm_stop_hex_list)
+            if not alarm_stop_frames and self.alarm_stop_hex:
+                alarm_stop_frames = [self.alarm_stop_hex]
+            for frame in alarm_stop_frames:
+                self._send(ser, frame)
             self._send(ser, STOP_WAVES_HEX)
             self.status_signal.emit("Stop commands sent")
 
@@ -949,6 +1184,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.control_port = int(control_port or 0)
         self.no_rtscts = bool(no_rtscts)
         self._is_closing = False
+        self._allow_close_during_capture = False
         self.trend_defs = config["trend_defs"]
         self.wave_defs = config["wave_defs"]
         self.positive_trend_rows = set()
@@ -968,6 +1204,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_last_seen_monotonic = {}
         self.wave_last_seen_by_row = {}  # Track all waveforms for header
         self._last_logged_available_waves = None
+        self.last_alarm_text = "none"
+        self.last_alarm_seen_monotonic = None
+        self.alarm_start_hex, self.alarm_stop_hex, self.alarm_start_hex_list, self.alarm_stop_hex_list = (
+            self._resolve_alarm_commands()
+        )
         self.current_output_file = ""
         self.current_file_state = "default"
         self.csv_worker = None
@@ -1056,6 +1297,78 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if isinstance(value, str) and value.strip():
             return value.strip()
         return fallback
+
+    def _resolve_alarm_commands(self):
+        """Return alarm start/stop request frames from config.
+
+        Uses S/5 protocol alarm semantics:
+        - start: XMIT_STATUS then ENTER_DIFFMODE
+        - stop: EXIT_DIFFMODE
+
+        Command values from the spec:
+        - DRI_AL_XMIT_STATUS = 0
+        - DRI_AL_ENTER_DIFFMODE = 2
+        - DRI_AL_EXIT_DIFFMODE = 3
+
+        Supported config keys:
+        - protocol.alarm_start_hex / protocol.alarm_stop_hex
+        - protocol.commands.alarm_start_hex / alarm_stop_hex
+        - protocol.commands.alarm_xmit_status_hex
+        - protocol.commands.alarm_enter_diffmode_hex
+        - protocol.commands.alarm_exit_diffmode_hex
+        """
+
+        def _pick(*paths):
+            for path in paths:
+                cur = self.config
+                ok = True
+                for key in path:
+                    if not isinstance(cur, dict) or key not in cur:
+                        ok = False
+                        break
+                    cur = cur[key]
+                if ok and isinstance(cur, str) and cur.strip():
+                    return cur.strip()
+            return ""
+
+        start_hex = _pick(
+            ("protocol", "alarm_start_hex"),
+            ("protocol", "commands", "alarm_start_hex"),
+        )
+        stop_hex = _pick(
+            ("protocol", "alarm_stop_hex"),
+            ("protocol", "commands", "alarm_stop_hex"),
+        )
+
+        xmit_status_hex = _pick(
+            ("protocol", "commands", "alarm_xmit_status_hex"),
+            ("protocol", "commands", "alarm_cmd_0_hex"),
+        )
+        enter_diff_hex = _pick(
+            ("protocol", "commands", "alarm_enter_diffmode_hex"),
+            ("protocol", "commands", "alarm_cmd_2_hex"),
+        )
+        exit_diff_hex = _pick(
+            ("protocol", "commands", "alarm_exit_diffmode_hex"),
+            ("protocol", "commands", "alarm_cmd_3_hex"),
+        )
+
+        start_list = []
+        stop_list = []
+        if xmit_status_hex:
+            start_list.append(xmit_status_hex)
+        if enter_diff_hex:
+            start_list.append(enter_diff_hex)
+        if exit_diff_hex:
+            stop_list.append(exit_diff_hex)
+
+        # Backward compatibility for single start/stop alarm frame fields.
+        if not start_list and start_hex:
+            start_list = [start_hex]
+        if not stop_list and stop_hex:
+            stop_list = [stop_hex]
+
+        return start_hex, stop_hex, start_list, stop_list
 
     def _resolve_signal_color(self, section, item, fallback):
         palette = self.colors.get(section, {})
@@ -1337,7 +1650,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _signal_source_paths(self):
         config_path = Path(self.config.get("path", ""))
-        base_dir = _get_config_dir()
+        base_dir = config_path.parent if config_path.exists() else Path.cwd()
         params_path = base_dir / "params5.txt"
         waves_path = base_dir / "waves5.txt"
 
@@ -1662,6 +1975,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         left.addWidget(self.capture_section)
         self.start_btn = QtWidgets.QPushButton("Start Monitoring")
         self.stop_btn = QtWidgets.QPushButton("Stop Monitoring")
+        self.stop_btn.setAutoDefault(True)
+        self.stop_btn.setDefault(False)
         self.stop_btn.setEnabled(False)
         self.capture_section.content_layout.addWidget(self.start_btn)
         self.capture_section.content_layout.addWidget(self.stop_btn)
@@ -1873,9 +2188,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # waveforms so clinicians can quickly confirm recency and channels.
         self.graph_header = QtWidgets.QFrame()
         self.graph_header.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        header_layout = QtWidgets.QHBoxLayout(self.graph_header)
+        header_layout = QtWidgets.QVBoxLayout(self.graph_header)
         header_layout.setContentsMargins(8, 6, 8, 6)
-        header_layout.setSpacing(12)
+        header_layout.setSpacing(4)
+
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(12)
 
         self.last_record_label = QtWidgets.QLabel(
             "Last record (header UTC): --"
@@ -1896,9 +2215,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.recent_waves_label.setStyleSheet(
             f"color:{self._cfg_color('text', 'secondary', '#23364d')};"
         )
-        header_layout.addWidget(self.last_record_label, 0)
-        header_layout.addWidget(self.elapsed_label, 0)
-        header_layout.addWidget(self.recent_waves_label, 1)
+        self.recent_alarm_label = QtWidgets.QLabel("Alarm: none")
+        self.recent_alarm_label.setWordWrap(True)
+        self.recent_alarm_label.setStyleSheet(
+            "font-weight: 600;"
+            f"color:{self._cfg_color('text', 'alarm', '#ff4757')};"
+        )
+
+        top_row.addWidget(self.last_record_label, 0)
+        top_row.addWidget(self.elapsed_label, 0)
+        top_row.addWidget(self.recent_waves_label, 1)
+        header_layout.addLayout(top_row)
+        header_layout.addWidget(self.recent_alarm_label, 0)
 
         self.graph_panel = QtWidgets.QWidget()
         graph_panel_layout = QtWidgets.QVBoxLayout(self.graph_panel)
@@ -2199,6 +2527,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_last_seen_by_row.clear()
         self.wave_user_unrequested_rows.clear()
         self.capture_started_monotonic = time.monotonic()
+        self.last_alarm_text = "none"
+        self.last_alarm_seen_monotonic = None
         self.trend_history_by_row.clear()
         for values in self.trend_buffers.values():
             values.clear()
@@ -2221,6 +2551,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             output_name=self.output_name,
             simulation_mode=self.simulation_mode,
             no_rtscts=self.no_rtscts,
+            alarm_start_hex=self.alarm_start_hex,
+            alarm_stop_hex=self.alarm_stop_hex,
+            alarm_start_hex_list=self.alarm_start_hex_list,
+            alarm_stop_hex_list=self.alarm_stop_hex_list,
         )
         self.worker.update_requested_wave_rows(self.wave_requested_rows)
         self.worker.package_signal.connect(self.on_package)
@@ -2232,6 +2566,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.stop_btn.setDefault(True)
 
         wave_fs_log = ", ".join(
             [
@@ -2260,6 +2595,42 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.worker.request_stop()
             self.log("Stop requested")
 
+    def _is_capture_running(self):
+        return bool(
+            self.worker is not None
+            and self.worker.isRunning()
+        )
+
+    def _unlock_all_sections_for_stop(self):
+        sections = self._all_lockable_sections()
+        if not any(s.is_locked for s in sections):
+            return False
+        for section in sections:
+            section.set_locked(False)
+        self._lock_btn.setText("🔓  Lock collapsed sections")
+        self._persist_lock_state()
+        return True
+
+    def _prepare_stop_focus_on_close_attempt(self):
+        unlocked = self._unlock_all_sections_for_stop()
+        if unlocked:
+            self.log("Unlocked sections. Use Stop Monitoring before closing.")
+
+        try:
+            if not self.capture_section.toggle_btn.isChecked():
+                self.capture_section.toggle_btn.setChecked(True)
+        except Exception:
+            pass
+
+        if self.stop_btn.isEnabled():
+            self.stop_btn.setDefault(True)
+            self.stop_btn.setFocus(QtCore.Qt.ActiveWindowFocusReason)
+            self.log(
+                "Monitoring is active. Press Enter on Stop Monitoring first."
+            )
+        else:
+            self.log("Monitoring is active. Stop monitoring before closing.")
+
     def _on_control_stop(self):
         # Marshal control-thread requests to the Qt main thread.
         QtCore.QTimer.singleShot(0, self._apply_control_stop)
@@ -2274,6 +2645,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             if time.monotonic() >= deadline:
                 self.log("Remote stop timeout reached; closing window")
+                self._allow_close_during_capture = True
                 self.close()
                 return
             QtCore.QTimer.singleShot(
@@ -2281,6 +2653,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 lambda: self._close_after_remote_stop(deadline),
             )
             return
+        self._allow_close_during_capture = True
         self.close()
 
     def _on_control_status(self):
@@ -2318,6 +2691,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         positive_trend_rows = payload.get("positive_trend_rows", [])
         positive_wave_rows = payload.get("positive_wave_rows", [])
         present_wave_rows = payload.get("present_wave_rows", [])
+        alarm_texts = payload.get("alarms", []) or []
 
         prev_trend_count = len(self.positive_trend_rows)
         prev_wave_count = len(self.positive_wave_rows)
@@ -2393,6 +2767,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 max_wave_t = max(max_wave_t, t_val)
 
         self.logical_now_sec = max(self.logical_now_sec, rel_t, max_wave_t)
+
+        if alarm_texts:
+            self.last_alarm_text = " | ".join(alarm_texts[:3])
+            self.last_alarm_seen_monotonic = time.monotonic()
+
         self._update_graph_header()
         self.update_plots()
 
@@ -2470,6 +2849,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 self._last_logged_available_waves = text
         else:
             self.recent_waves_label.setText(f"Waveforms (last 5s): {text}")
+
+        alarm_text = "none"
+        if self.last_alarm_seen_monotonic is not None:
+            alarm_age = time.monotonic() - float(self.last_alarm_seen_monotonic)
+            if alarm_age <= 30.0 and self.last_alarm_text:
+                alarm_text = self.last_alarm_text
+        self.recent_alarm_label.setText(f"Alarm: {alarm_text}")
 
     @staticmethod
     def _build_wrapped_series(points, window_sec, now_sec, gap_sec=1.0):
@@ -2574,6 +2960,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.log(f"Capture finished. Saved: {output_file}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setDefault(False)
+        self._allow_close_during_capture = False
 
     def on_error(self, error_message):
         self.sim_idle_timer.stop()
@@ -2581,6 +2969,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.log(f"ERROR: {error_message}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setDefault(False)
+        self._allow_close_during_capture = False
 
     def _on_simulation_idle_timeout(self):
         self.log("No package for 10 seconds in simulation mode")
@@ -2759,6 +3149,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.wave_request_state_timer.start()
 
     def closeEvent(self, event):
+        if (
+            self._is_capture_running()
+            and not self._allow_close_during_capture
+        ):
+            event.ignore()
+            self._prepare_stop_focus_on_close_attempt()
+            return
+
         self._is_closing = True
         try:
             self.wave_request_state_timer.stop()
@@ -2777,6 +3175,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    _startup_log(
+        f"qt main start frozen={getattr(sys, 'frozen', False)} argv={sys.argv!r}"
+    )
     parser = argparse.ArgumentParser(
         description="Interactive Qt GUI for pycollect capture."
     )
@@ -2836,19 +3237,41 @@ def main():
     )
     args = parser.parse_args()
 
-    base_dir = _get_config_dir()
     cfg_path = args.config.strip() if args.config else None
 
     try:
-        config = load_signal_config(base_dir, cfg_path)
+        config = load_signal_config(cfg_path)
     except Exception as exc:
-        print(f"Failed to load signal config: {exc}", file=sys.stderr)
+        msg = f"Failed to load signal config:\n{exc}"
+        _startup_log(msg)
+        print(msg, file=sys.stderr)
+        try:
+            app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+            QtWidgets.QMessageBox.critical(
+                None,
+                "pyCollect - Config Error",
+                msg,
+            )
+            app.processEvents()
+        except Exception:
+            pass
         sys.exit(1)
+
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "GEHealthCare.pyCollect"
+            )
+        except Exception:
+            pass
 
     if args.baud is not None and args.baud in (19200, 115200):
         config["initial_baudrate"] = args.baud
 
     app = QtWidgets.QApplication(sys.argv)
+    icon_path = _resolve_icon_path()
+    if icon_path is not None:
+        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
     pg.setConfigOptions(antialias=True)
 
     if args.duration is not None:
@@ -2867,6 +3290,8 @@ def main():
         control_port=args.control_port,
         no_rtscts=args.no_rtscts,
     )
+    if icon_path is not None:
+        win.setWindowIcon(QtGui.QIcon(str(icon_path)))
     win.show()
     win.raise_()
     win.activateWindow()
@@ -2875,4 +3300,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        _startup_log("FATAL\n" + traceback.format_exc())
+        raise
