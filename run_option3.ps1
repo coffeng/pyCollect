@@ -2,6 +2,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PythonExe,
 
+    [string]$ExePath = "",
+
     [Parameter(Mandatory = $true)]
     [string]$Root,
 
@@ -43,7 +45,12 @@ $simArgs = @(
 $sim = Start-Process -FilePath $PythonExe -ArgumentList $simArgs -PassThru -WorkingDirectory $Root
 
 try {
-    & $PythonExe code\pycollect.py --qt-gui $GuiPort --baud 115200 --no-rtscts --output output\record.drc --simulation-mode --debug-stdout --control-port $GuiCtrlPort
+    if ($ExePath -and (Test-Path $ExePath)) {
+        & $ExePath --qt-gui $GuiPort --baud 115200 --no-rtscts --output output\record.drc --simulation-mode --debug-stdout --control-port $GuiCtrlPort
+    }
+    else {
+        & $PythonExe code\pycollect.py --qt-gui $GuiPort --baud 115200 --no-rtscts --output output\record.drc --simulation-mode --debug-stdout --control-port $GuiCtrlPort
+    }
 }
 finally {
     try {

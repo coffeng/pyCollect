@@ -10,6 +10,9 @@ workflow used in option 3.
 - Added localhost control servers so the simulator and GUI can be queried and
   stopped cleanly from PowerShell or other local scripts.
 - Added dedicated option-3 launcher flow on Windows via `run_option3.ps1`.
+- Consolidated Windows launching into `run_pycollect.bat` with
+  `PYCOLLECT_RUNTIME=python|exe` for options 2/3/5, removing the separate
+  EXE-only launcher scripts.
 - Updated simulation mode so the simulator sends the DRC data as-is instead of
   filtering outgoing waveforms to match the current GUI request set.
 - Updated simulation-mode waveform catalog colors in the GUI:
@@ -39,6 +42,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\send_control.ps1 -Target g
 ### Option 3 Notes
 
 - `run_pycollect.bat 3` now uses `run_option3.ps1`.
+- `run_option3.ps1` supports both Python and EXE collector launches.
 - The simulator is started with `--simulation-mode`, `--no-rtscts`, and
   `--max-records 0` so each loop completes the entire DRC file before
   restarting.
