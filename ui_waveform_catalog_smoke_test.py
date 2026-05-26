@@ -118,6 +118,9 @@ def test_displayed_rows_selection_rules(win: gui.PyCollectQtWindow) -> None:
         def update_requested_wave_rows(self, _rows):
             return None
 
+        def update_wave_defs(self, _wave_defs):
+            return None
+
     try:
         win.current_file_state = "blue"
         win.worker = _FakeWorker()

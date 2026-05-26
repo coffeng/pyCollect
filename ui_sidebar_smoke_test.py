@@ -135,13 +135,13 @@ def test_capture(win: gui.PyCollectQtWindow) -> None:
 
 def test_signal_selection(win: gui.PyCollectQtWindow) -> None:
     print("[4] Signal Selection section")
-    for slot in ("trend1", "trend2", "trend3", "trend4",
-                 "wave1", "wave2", "wave3", "wave4"):
-        _expect(slot in win.slot_buttons, f"slot button {slot} exists")
-    # Verify clicking a trend slot does not crash. We patch the dialog
-    # to avoid blocking exec_().
-    btn = win.slot_buttons["trend1"]
-    # Hook QDialog.exec_ to immediately return rejected
+    _expect(hasattr(win, "_select_trends_btn"),
+            "Signal Setup has Select Trends button")
+    _expect(isinstance(win._select_trends_btn, QtWidgets.QPushButton),
+            "_select_trends_btn is a QPushButton")
+    # Verify clicking the button does not crash. We patch QDialog.exec_
+    # to avoid blocking.
+    btn = win._select_trends_btn
     original_exec = QtWidgets.QDialog.exec_
 
     def fake_exec(self):
@@ -157,7 +157,7 @@ def test_signal_selection(win: gui.PyCollectQtWindow) -> None:
         print(f"    exception: {exc}")
     finally:
         QtWidgets.QDialog.exec_ = original_exec
-    _expect(ok, "trend slot click opens selector without crash")
+    _expect(ok, "Select Trends button click opens selector without crash")
 
 
 def test_waveform_catalog_collapsible(win: gui.PyCollectQtWindow) -> None:

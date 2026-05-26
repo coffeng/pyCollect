@@ -130,13 +130,13 @@ def load_signal_config(base_dir, config_path=None):
     trend_select = raw_cfg["channels"]["trends"]
     wave_select = raw_cfg["channels"]["waves"]
 
-    if len(trend_select) != 4:
+    if len(trend_select) == 0:
         raise SignalConfigError(
-            "JSON must declare exactly 4 trend row identifiers"
+            "JSON must declare at least 1 trend row identifier"
         )
-    if len(wave_select) != 4:
+    if len(wave_select) == 0:
         raise SignalConfigError(
-            "JSON must declare exactly 4 waveform row identifiers"
+            "JSON must declare at least 1 waveform row identifier"
         )
 
     all_trend_defs = []
@@ -197,7 +197,7 @@ def load_signal_config(base_dir, config_path=None):
                 f"Trend row_identifier out of range: {row_id}"
             )
         selected = dict(trend_by_row[row_id])
-        selected["id"] = f"trend{idx + 1}"
+        selected["id"] = f"t_{row_id}"
         trend_defs.append(selected)
 
     wave_defs = []
@@ -208,7 +208,7 @@ def load_signal_config(base_dir, config_path=None):
                 f"Wave row_identifier out of range: {row_id}"
             )
         selected = dict(wave_by_row[row_id])
-        selected["id"] = f"wave{idx + 1}"
+        selected["id"] = f"w_{row_id}"
         wave_defs.append(selected)
 
     ui_cfg = raw_cfg.get("ui", {})
@@ -417,6 +417,18 @@ class CollectorWorker(QtCore.QThread):
         if changed:
             self._rebuild_wave_type_map()
             self.wave_mapping_signal.emit(list(self.dynamic_wave_types))
+
+    def update_wave_defs(self, new_wave_defs):
+        """Thread-safe update of wave definitions from GUI thread."""
+        with self._wave_req_lock:
+            self.wave_defs = list(new_wave_defs)
+            self.selected_wave_ids = [item["id"] for item in self.wave_defs]
+            self.dynamic_wave_types = [
+                item["sr_type"]
+                for item in self.wave_defs
+                if int(item.get("sr_type", 0)) > 0
+            ]
+            self._rebuild_wave_type_map()
 
     def request_stop(self):
         self._stop_requested = True
@@ -920,11 +932,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # Waveform request catalog state.
         # wave_requested_rows: rows the user explicitly asked for.
         # wave_last_received_at: monotonic time of last sample per row.
-        # wave_slot_row_ids: maps slot index (0-3) to row_id displayed
         self.wave_requested_rows = set()
         self.wave_user_unrequested_rows = set()
-        num_slots = len(self.wave_defs)
-        self.wave_slot_row_ids = [None] * num_slots  # Track row_id per slot
         self.wave_last_received_at = {}
         self.wave_request_buttons = {}
         self.WAVE_REQUEST_TIMEOUT_SEC = 5.0
@@ -955,12 +964,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.trend_curves = {}
         self.wave_plots = {}
         self.wave_curves = {}
-        self.slot_buttons = {}
         self.selector_popups = {}
-        self._trend_selector_slot_idx = None
         self.selector_filter_dirty = {
             "trend": True,
-            "wave": True,
         }
 
         self.sim_idle_timer = QtCore.QTimer(self)
@@ -1004,10 +1010,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # Seed: displayed rows are auto-requested at startup.
         for row_id in self._displayed_wave_row_ids():
             self.wave_requested_rows.add(int(row_id))
-        # Initialize slot tracking: each slot displays its initial row_id.
-        for idx, item in enumerate(self.wave_defs):
-            self.wave_slot_row_ids[idx] = int(item.get("row_identifier", 0))
         self._refresh_wave_request_button_states()
+        # Build initial graph panels from loaded selections.
+        self._rebuild_trend_plots()
+        self._rebuild_wave_plots()
 
     def _cfg_color(self, section, key, fallback):
         section_data = self.colors.get(section, {})
@@ -1629,33 +1635,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.signal_section = CollapsibleSection("Signal Setup", expanded=True)
         left.addWidget(self.signal_section)
-        selector_grid = QtWidgets.QGridLayout()
-        selector_grid.setContentsMargins(0, 0, 0, 0)
-        selector_grid.setHorizontalSpacing(6)
-        selector_grid.setVerticalSpacing(6)
-        self.signal_section.content_layout.addLayout(selector_grid)
-
-        for row in range(4):
-            trend_btn = QtWidgets.QPushButton()
-            wave_btn = QtWidgets.QPushButton()
-            trend_slot = f"trend{row + 1}"
-            wave_slot = f"wave{row + 1}"
-            self.slot_buttons[trend_slot] = trend_btn
-            self.slot_buttons[wave_slot] = wave_btn
-            selector_grid.addWidget(trend_btn, row, 0)
-            selector_grid.addWidget(wave_btn, row, 1)
-            trend_btn.clicked.connect(
-                lambda _checked=False, idx=row: self.open_slot_selector(
-                    "trend",
-                    idx,
-                )
-            )
-            wave_btn.clicked.connect(
-                lambda _checked=False, idx=row: self.open_slot_selector(
-                    "wave",
-                    idx,
-                )
-            )
+        self._select_trends_btn = QtWidgets.QPushButton("Select Trends...")
+        self._select_trends_btn.clicked.connect(self.open_trend_selector)
+        self.signal_section.content_layout.addWidget(self._select_trends_btn)
+        self.signal_section.content_layout.addWidget(
+            _hint("Open the trend selector to choose which parameters to graph.")
+        )
 
         self.status_section = CollapsibleSection("Recorder Output", expanded=True)
         left.addWidget(self.status_section)
@@ -1669,7 +1654,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         # _wave_request_button_state() for transitions. Displayed rows are
         # auto-requested and protected from being unrequested.
         self.wave_catalog_section = CollapsibleSection(
-            "Waveform Status",
+            "Waveform Selection",
             expanded=False,
         )
         left.insertWidget(
@@ -1752,56 +1737,28 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.graph_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.graph_splitter.setChildrenCollapsible(False)
 
+        # Trends panel — scrollable; plots are added dynamically by _rebuild_trend_plots
+        trends_scroll = QtWidgets.QScrollArea()
+        trends_scroll.setWidgetResizable(True)
+        trends_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.trends_panel = QtWidgets.QWidget()
-        trends_layout = QtWidgets.QVBoxLayout(self.trends_panel)
-        trends_layout.setContentsMargins(0, 0, 0, 0)
-        trends_layout.setSpacing(8)
+        self.trends_layout = QtWidgets.QVBoxLayout(self.trends_panel)
+        self.trends_layout.setContentsMargins(0, 0, 0, 0)
+        self.trends_layout.setSpacing(4)
+        trends_scroll.setWidget(self.trends_panel)
 
-        trend_fallbacks = ["#2b83f6", "#24b47e", "#b38ddb", "#6fd3ff"]
-        for idx, item in enumerate(self.trend_defs):
-            plot = pg.PlotWidget(title=item["title"])
-            self._style_plot_widget(plot)
-            plot.setLabel("left", text=item["label"], units=item["unit"])
-            curve = plot.plot(
-                pen=pg.mkPen(
-                    self._resolve_signal_color(
-                        "trends",
-                        item,
-                        trend_fallbacks[idx % len(trend_fallbacks)],
-                    ),
-                    width=2,
-                )
-            )
-            self.trend_plots[item["id"]] = plot
-            self.trend_curves[item["id"]] = curve
-            trends_layout.addWidget(plot, 1)
-
+        # Waveforms panel — scrollable; plots are added dynamically by _rebuild_wave_plots
+        waves_scroll = QtWidgets.QScrollArea()
+        waves_scroll.setWidgetResizable(True)
+        waves_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.waves_panel = QtWidgets.QWidget()
-        waves_layout = QtWidgets.QVBoxLayout(self.waves_panel)
-        waves_layout.setContentsMargins(0, 0, 0, 0)
-        waves_layout.setSpacing(8)
+        self.waves_layout = QtWidgets.QVBoxLayout(self.waves_panel)
+        self.waves_layout.setContentsMargins(0, 0, 0, 0)
+        self.waves_layout.setSpacing(4)
+        waves_scroll.setWidget(self.waves_panel)
 
-        wave_fallbacks = ["#f23c3c", "#ff8c42", "#ff5a7a", "#f6d743"]
-        for idx, item in enumerate(self.wave_defs):
-            plot = pg.PlotWidget(title=item["title"])
-            self._style_plot_widget(plot)
-            plot.setLabel("left", text=item["label"], units=item["unit"])
-            curve = plot.plot(
-                pen=pg.mkPen(
-                    self._resolve_signal_color(
-                        "waveforms",
-                        item,
-                        wave_fallbacks[idx % len(wave_fallbacks)],
-                    ),
-                    width=1.5,
-                )
-            )
-            self.wave_plots[item["id"]] = plot
-            self.wave_curves[item["id"]] = curve
-            waves_layout.addWidget(plot, 1)
-
-        self.graph_splitter.addWidget(self.trends_panel)
-        self.graph_splitter.addWidget(self.waves_panel)
+        self.graph_splitter.addWidget(trends_scroll)
+        self.graph_splitter.addWidget(waves_scroll)
         self.graph_splitter.setStretchFactor(0, 1)
         self.graph_splitter.setStretchFactor(1, 1)
         self.graph_splitter.setSizes([500, 500])
@@ -1846,7 +1803,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         graph_panel_layout.addWidget(self.graph_splitter, 1)
 
         layout.addWidget(self.graph_panel, 1)
-        self.refresh_slot_buttons()
         self._prepare_selector_popups()
         self._update_graph_header()
 
@@ -1858,25 +1814,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.ecg_window_spin.valueChanged.connect(self.update_plots)
         self.graph_splitter.splitterMoved.connect(self.on_splitter_moved)
 
-    @staticmethod
-    def _slot_label(prefix, item):
-        return f"{prefix}: {item['label']} [{item['unit']}]"
-
-    def refresh_slot_buttons(self):
-        for idx, item in enumerate(self.trend_defs):
-            slot = f"trend{idx + 1}"
-            self.slot_buttons[slot].setText(self._slot_label("T", item))
-        for idx, item in enumerate(self.wave_defs):
-            slot = f"wave{idx + 1}"
-            self.slot_buttons[slot].setText(self._slot_label("W", item))
-
     def _prepare_selector_popups(self):
         self.selector_popups["trend"] = self._build_trend_grid_popup()
-        self.selector_popups["wave"] = self._build_selector_popup("wave")
 
     def _build_trend_grid_popup(self):
         popup = QtWidgets.QDialog(self)
-        popup.setWindowTitle("Select Trend Parameter")
+        popup.setWindowTitle("Select Trend Parameters")
         popup.resize(760, 520)
         layout = QtWidgets.QVBoxLayout(popup)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1900,17 +1843,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         total = len(self.all_trend_defs)
         rows = max(1, int(math.ceil(float(total) / float(columns))))
         trend_buttons = []
+        selected_row_ids = {int(item["row_identifier"]) for item in self.trend_defs}
         for idx, item in enumerate(self.all_trend_defs):
             row = idx % rows
             col = idx // rows
             btn = QtWidgets.QPushButton(item["label"])
+            btn.setCheckable(True)
+            btn.setChecked(int(item["row_identifier"]) in selected_row_ids)
             btn.setToolTip(
                 f"Row {item['row_identifier']} | "
                 f"{item['label']} [{item['unit']}]"
             )
-            btn.clicked.connect(
-                lambda _checked=False, selected=dict(item):
-                self._on_trend_grid_pick(selected)
+            btn.toggled.connect(
+                lambda checked, selected=dict(item):
+                self._on_trend_toggle(selected, checked)
             )
             trend_buttons.append(
                 {
@@ -1928,264 +1874,170 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             )
         )
 
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(popup.accept)
+        layout.addWidget(close_btn)
+
         return {
             "dialog": popup,
             "positive_only": positive_only,
             "trend_buttons": trend_buttons,
         }
 
-    def _on_trend_grid_pick(self, item):
-        if self._trend_selector_slot_idx is None:
-            return
-        self._apply_slot_selection(
-            "trend",
-            self._trend_selector_slot_idx,
-            item,
-        )
-        self._trend_selector_slot_idx = None
-        self.selector_popups["trend"]["dialog"].accept()
+    def _on_trend_toggle(self, item, checked):
+        """Called when a trend toggle button is clicked in the selector dialog."""
+        row_id = int(item["row_identifier"])
+        selected_row_ids = [int(d["row_identifier"]) for d in self.trend_defs]
+        if checked and row_id not in selected_row_ids:
+            selected = dict(item)
+            selected["id"] = f"t_{row_id}"
+            self.trend_defs.append(selected)
+            if selected["id"] not in self.trend_buffers:
+                self.trend_buffers[selected["id"]] = deque()
+            self._sync_all_trend_buffers()
+            self._rebuild_trend_plots()
+        elif not checked and row_id in selected_row_ids:
+            self.trend_defs = [d for d in self.trend_defs
+                               if int(d["row_identifier"]) != row_id]
+            self._rebuild_trend_plots()
 
-    def _build_selector_popup(self, category):
-        popup = QtWidgets.QDialog(self, QtCore.Qt.Popup)
-        popup.setWindowTitle("Select Signal")
-        popup.setMinimumSize(760, 360)
-        layout = QtWidgets.QVBoxLayout(popup)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        positive_only = QtWidgets.QCheckBox("Only rows with positive data")
-        positive_only.setChecked(True)
-        layout.addWidget(positive_only)
-
-        table = QtWidgets.QTableWidget()
-        table.setColumnCount(6)
-        if category == "trend":
-            table.setHorizontalHeaderLabels(
-                ["Row", "Label", "Unit", "Divider", "Subgroup", "Index"]
-            )
-            defs = self.all_trend_defs
-        else:
-            table.setHorizontalHeaderLabels(
-                ["Row", "Label", "Unit", "Divider", "SampleHz", "Type"]
-            )
-            defs = self.all_wave_defs
-
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        layout.addWidget(table, 1)
-
-        for row_idx, item in enumerate(defs):
-            table.insertRow(row_idx)
-            cells = [
-                str(item["row_identifier"]),
-                item["label"],
-                item["unit"],
-                f"{item['divider']}",
-            ]
-            if category == "trend":
-                cells.extend(
-                    [
-                        str(item["subgroup"]),
-                        str(item["value_index"]),
-                    ]
-                )
-            else:
-                cells.extend(
-                    [
-                        f"{item['sample_hz']:.1f}",
-                        str(item["sr_type"]),
-                    ]
-                )
-
-            for col, value in enumerate(cells):
-                table.setItem(row_idx, col, QtWidgets.QTableWidgetItem(value))
-            table.item(row_idx, 0).setData(QtCore.Qt.UserRole, item)
-
-        buttons = QtWidgets.QHBoxLayout()
-        buttons.addStretch(1)
-        choose_btn = QtWidgets.QPushButton("Choose")
-        cancel_btn = QtWidgets.QPushButton("Cancel")
-        buttons.addWidget(choose_btn)
-        buttons.addWidget(cancel_btn)
-        layout.addLayout(buttons)
-
-        positive_only.toggled.connect(
-            lambda _checked=False, cat=category:
-            self._apply_selector_filter(cat, force=True)
-        )
-        table.itemDoubleClicked.connect(
-            lambda _item, cat=category: self._selector_accept(cat)
-        )
-        choose_btn.clicked.connect(
-            lambda _checked=False, cat=category: self._selector_accept(cat)
-        )
-        cancel_btn.clicked.connect(popup.reject)
-
-        return {
-            "dialog": popup,
-            "table": table,
-            "positive_only": positive_only,
-        }
+    def open_trend_selector(self):
+        """Open the trend selector dialog."""
+        # Rebuild the popup so checked state matches current trend_defs
+        self.selector_popups["trend"] = self._build_trend_grid_popup()
+        self._apply_selector_filter("trend", force=True)
+        self.selector_popups["trend"]["dialog"].exec_()
 
     def _apply_selector_filter(self, category, force=False):
-        state = self.selector_popups[category]
-        if category == "trend" and "table" not in state:
-            use_positive = state["positive_only"].isChecked()
-            if (
-                not force
-                and use_positive
-                and not self.selector_filter_dirty[category]
-            ):
-                return
-
-            positive_rows = self.positive_trend_rows
-            for entry in state["trend_buttons"]:
-                row_id = entry["row_identifier"]
-                visible = True
-                if use_positive:
-                    visible = row_id in positive_rows
-                entry["button"].setVisible(visible)
-
-            if use_positive:
-                self.selector_filter_dirty[category] = False
+        state = self.selector_popups.get(category)
+        if state is None:
             return
-
-        table = state["table"]
         use_positive = state["positive_only"].isChecked()
-
         if (
             not force
             and use_positive
-            and not self.selector_filter_dirty[category]
+            and not self.selector_filter_dirty.get(category, True)
         ):
             return
 
-        positive_rows = (
-            self.positive_trend_rows
-            if category == "trend"
-            else self.positive_wave_rows
-        )
-
-        table.setUpdatesEnabled(False)
-        first_visible = -1
-        for row in range(table.rowCount()):
-            cell = table.item(row, 0)
-            item = cell.data(QtCore.Qt.UserRole)
+        positive_rows = self.positive_trend_rows
+        for entry in state["trend_buttons"]:
+            row_id = entry["row_identifier"]
             visible = True
             if use_positive:
-                visible = item["row_identifier"] in positive_rows
-            table.setRowHidden(row, not visible)
-            if visible and first_visible < 0:
-                first_visible = row
-
-        if first_visible >= 0:
-            table.selectRow(first_visible)
-        table.setUpdatesEnabled(True)
+                visible = row_id in positive_rows
+            entry["button"].setVisible(visible)
 
         if use_positive:
             self.selector_filter_dirty[category] = False
 
-    def _selector_accept(self, category):
-        state = self.selector_popups[category]
-        table = state["table"]
-        row = table.currentRow()
-        if row < 0:
-            return
-        if table.isRowHidden(row):
-            return
-        state["dialog"].accept()
+    # --- Graph panel rebuilding ------------------------------------------
 
-    def _apply_slot_selection(self, category, slot_idx, new_item):
-        if category == "trend":
-            slot_id = f"trend{slot_idx + 1}"
-            selected = dict(new_item)
-            selected["id"] = slot_id
-            self.trend_defs[slot_idx] = selected
-            self._sync_trend_slot_buffer(slot_idx)
-            plot = self.trend_plots[slot_id]
-        else:
-            slot_id = f"wave{slot_idx + 1}"
-            selected = dict(new_item)
-            selected["id"] = slot_id
-            self.wave_defs[slot_idx] = selected
-            row_id = int(new_item.get("row_identifier", 0))
-            self.wave_slot_row_ids[slot_idx] = row_id
-            self.wave_buffers[slot_id].clear()
-            self.wave_cursors[slot_id] = None
-            plot = self.wave_plots[slot_id]
+    def _calc_graph_min_height(self):
+        try:
+            screen_h = QtWidgets.QApplication.primaryScreen().size().height()
+        except Exception:
+            screen_h = 1080
+        return max(80, screen_h // 10)
 
-        plot.setTitle(selected["title"])
-        plot.setLabel("left", text=selected["label"], units=selected["unit"])
-        if category == "trend":
-            curve_color = self._resolve_signal_color(
-                "trends",
-                selected,
-                "#2b83f6",
+    def _rebuild_trend_plots(self):
+        """Clear and recreate trend plots from self.trend_defs."""
+        for item_id, plot in list(self.trend_plots.items()):
+            self.trends_layout.removeWidget(plot)
+            plot.setParent(None)
+            plot.deleteLater()
+        self.trend_plots.clear()
+        self.trend_curves.clear()
+
+        min_h = self._calc_graph_min_height()
+        trend_fallbacks = ["#2b83f6", "#24b47e", "#b38ddb", "#6fd3ff"]
+        for idx, item in enumerate(self.trend_defs):
+            plot = pg.PlotWidget(title=item["title"])
+            self._style_plot_widget(plot)
+            plot.setLabel("left", text=item["label"], units=item["unit"])
+            plot.setMinimumHeight(min_h)
+            curve = plot.plot(
+                pen=pg.mkPen(
+                    self._resolve_signal_color(
+                        "trends",
+                        item,
+                        trend_fallbacks[idx % len(trend_fallbacks)],
+                    ),
+                    width=2,
+                )
             )
-            self.trend_curves[slot_id].setPen(pg.mkPen(curve_color, width=2))
-        else:
-            curve_color = self._resolve_signal_color(
-                "waveforms",
-                selected,
-                "#f23c3c",
+            self.trend_plots[item["id"]] = plot
+            self.trend_curves[item["id"]] = curve
+            self.trends_layout.addWidget(plot)
+
+        self.update_plots()
+
+    def _rebuild_wave_plots(self):
+        """Clear and recreate wave plots from self.wave_defs."""
+        for item_id, plot in list(self.wave_plots.items()):
+            self.waves_layout.removeWidget(plot)
+            plot.setParent(None)
+            plot.deleteLater()
+        self.wave_plots.clear()
+        self.wave_curves.clear()
+
+        min_h = self._calc_graph_min_height()
+        wave_fallbacks = ["#f23c3c", "#ff8c42", "#ff5a7a", "#f6d743"]
+        for idx, item in enumerate(self.wave_defs):
+            plot = pg.PlotWidget(title=item["title"])
+            self._style_plot_widget(plot)
+            plot.setLabel("left", text=item["label"], units=item["unit"])
+            plot.setMinimumHeight(min_h)
+            curve = plot.plot(
+                pen=pg.mkPen(
+                    self._resolve_signal_color(
+                        "waveforms",
+                        item,
+                        wave_fallbacks[idx % len(wave_fallbacks)],
+                    ),
+                    width=1.5,
+                )
             )
-            self.wave_curves[slot_id].setPen(pg.mkPen(curve_color, width=1.5))
-        self.refresh_slot_buttons()
-        if category == "trend":
-            self.update_plots()
-        else:
-            self.update_plots(force=True)
-        self.log(f"Updated {slot_id} to row {selected['row_identifier']}")
+            self.wave_plots[item["id"]] = plot
+            self.wave_curves[item["id"]] = curve
+            self.waves_layout.addWidget(plot)
 
-    def _sync_trend_slot_buffer(self, slot_idx):
-        slot_id = f"trend{slot_idx + 1}"
-        row_id = self.trend_defs[slot_idx]["row_identifier"]
-        history = self.trend_history_by_row.get(row_id)
-        if history is None:
-            self.trend_buffers[slot_id].clear()
-            return
-        self.trend_buffers[slot_id] = deque(history)
+        self.update_plots()
 
-    def open_slot_selector(self, category, slot_idx):
-        if category == "trend":
-            self._trend_selector_slot_idx = slot_idx
-            slot_name = f"trend{slot_idx + 1}"
-            parent_button = self.slot_buttons[slot_name]
-            dialog = self.selector_popups["trend"]["dialog"]
-            self._apply_selector_filter("trend", force=False)
-            dialog.move(
-                parent_button.mapToGlobal(parent_button.rect().bottomLeft())
-            )
-            dialog.exec_()
-            self._trend_selector_slot_idx = None
-            return
+    def _rebuild_wave_defs(self):
+        """Rebuild wave_defs (sorted by row_id) from wave_requested_rows."""
+        all_wave_by_row = {
+            int(item["row_identifier"]): item for item in self.all_wave_defs
+        }
+        new_wave_defs = []
+        for row_id in sorted(self.wave_requested_rows):
+            item = all_wave_by_row.get(row_id)
+            if item is None:
+                continue
+            d = dict(item)
+            d["id"] = f"w_{row_id}"
+            new_wave_defs.append(d)
+        # Ensure buffers/cursors exist for all new IDs
+        for item in new_wave_defs:
+            if item["id"] not in self.wave_buffers:
+                self.wave_buffers[item["id"]] = deque()
+                self.wave_cursors[item["id"]] = None
+        self.wave_defs = new_wave_defs
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.update_wave_defs(self.wave_defs)
 
-        if (
-            category != "trend"
-            and self.worker is not None
-            and self.worker.isRunning()
-        ):
-            self.log("Stop capture before changing signal selections")
-            return
-
-        slot_name = f"{category}{slot_idx + 1}"
-        parent_button = self.slot_buttons[slot_name]
-        state = self.selector_popups[category]
-
-        self._apply_selector_filter(category, force=False)
-        state["dialog"].move(
-            parent_button.mapToGlobal(parent_button.rect().bottomLeft())
-        )
-
-        if state["dialog"].exec_() != QtWidgets.QDialog.Accepted:
-            return
-        row = state["table"].currentRow()
-        if row < 0:
-            return
-        picked = state["table"].item(row, 0).data(QtCore.Qt.UserRole)
-        self._apply_slot_selection(category, slot_idx, picked)
+    def _sync_all_trend_buffers(self):
+        """Sync all active trend slot buffers from trend_history_by_row."""
+        for item in self.trend_defs:
+            row_id = item["row_identifier"]
+            buf_id = item["id"]
+            if buf_id not in self.trend_buffers:
+                self.trend_buffers[buf_id] = deque()
+            history = self.trend_history_by_row.get(row_id)
+            if history is None:
+                self.trend_buffers[buf_id].clear()
+            else:
+                self.trend_buffers[buf_id] = deque(history)
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -2329,65 +2181,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.log("Stop requested")
 
     def on_wave_mapping(self, wave_row_ids):
-        """Handle available waveforms from record header.
-
-        Graphs display a subset of catalog-requested waveforms.
-        If a slot's waveform is no longer available, replace it with
-        another requested waveform not yet displayed.
-        """
-        if not isinstance(wave_row_ids, (list, tuple)):
-            return
-
-        available_wave_rows = {int(r) for r in wave_row_ids}
-        all_wave_by_row = {
-            int(item["row_identifier"]): item
-            for item in self.all_wave_defs
-        }
-
-        changed_slots = []
-        currently_displayed = set()
-
-        # First pass: collect what's currently displayed
-        for idx in range(len(self.wave_defs)):
-            slot_row = self.wave_slot_row_ids[idx]
-            if slot_row is not None:
-                currently_displayed.add(slot_row)
-
-        # Second pass: replace slots with missing waveforms
-        for idx in range(len(self.wave_defs)):
-            slot_row = self.wave_slot_row_ids[idx]
-
-            # Skip if not assigned or still available
-            if slot_row is None or slot_row in available_wave_rows:
-                continue
-
-            # Find replacement from requested+available rows
-            replacement_row = None
-            for req_row in sorted(self.wave_requested_rows):
-                if req_row not in available_wave_rows:
-                    continue
-                if req_row in currently_displayed:
-                    continue
-                replacement_row = req_row
-                break
-
-            if replacement_row is None:
-                continue
-
-            new_item = all_wave_by_row.get(replacement_row)
-            if new_item is None:
-                continue
-
-            self._apply_slot_selection("wave", idx, new_item)
-            self.wave_slot_row_ids[idx] = replacement_row
-            currently_displayed.add(replacement_row)
-            changed_slots.append(f"wave{idx + 1}->row{replacement_row}")
-
-        if changed_slots:
-            self.log(
-                "Auto-replaced unavailable wave slots: "
-                + ", ".join(changed_slots)
-            )
+        """Wave graphs are driven by catalog buttons; mapping is informational only."""
+        pass
 
     def on_package(self, payload):
         rel_t = float(payload.get("time", 0.0))
@@ -2415,8 +2210,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.positive_wave_rows.update(positive_wave_rows)
         if len(self.positive_trend_rows) != prev_trend_count:
             self.selector_filter_dirty["trend"] = True
-        if len(self.positive_wave_rows) != prev_wave_count:
-            self.selector_filter_dirty["wave"] = True
 
         if self.simulation_mode:
             # Keep GUI open in simulation mode when stream pauses.
@@ -2460,8 +2253,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             while history and history[0][0] < cutoff:
                 history.popleft()
 
-        for idx in range(len(self.trend_defs)):
-            self._sync_trend_slot_buffer(idx)
+        self._sync_all_trend_buffers()
 
         max_wave_t = rel_t
         now_mono = time.monotonic()
@@ -2576,6 +2368,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         if force:
             for item in self.trend_defs:
+                if item["id"] not in self.trend_curves:
+                    continue
                 self.trend_curves[item["id"]].setData([], [])
                 self.trend_plots[item["id"]].setXRange(
                     0,
@@ -2583,6 +2377,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     padding=0.0,
                 )
             for item in self.wave_defs:
+                if item["id"] not in self.wave_curves:
+                    continue
                 self.wave_curves[item["id"]].setData([], [])
                 self.wave_plots[item["id"]].setXRange(
                     0,
@@ -2592,7 +2388,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
 
         for item in self.trend_defs:
-            points = self.trend_buffers[item["id"]]
+            if item["id"] not in self.trend_curves:
+                continue
+            points = self.trend_buffers.get(item["id"])
             if points:
                 this_now = series_now(points)
                 x_data, y_data = self._build_wrapped_series(
@@ -2609,7 +2407,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             )
 
         for item in self.wave_defs:
-            points = self.wave_buffers[item["id"]]
+            if item["id"] not in self.wave_curves:
+                continue
+            points = self.wave_buffers.get(item["id"])
             if points:
                 this_now = series_now(points)
                 x_data, y_data = self._build_wrapped_series(
@@ -2737,6 +2537,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         if self.worker is not None and self.worker.isRunning():
             self.worker.update_requested_wave_rows(self.wave_requested_rows)
+        self._rebuild_wave_defs()
+        self._rebuild_wave_plots()
         self._apply_wave_request_button_style(row_id)
 
     def _save_runtime_config(self):
