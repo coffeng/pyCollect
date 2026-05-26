@@ -2,6 +2,10 @@
 """Quick test: use copied pycollect.py to read only 5 records from simulator."""
 
 import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "code"))
 
 import pycollect
 

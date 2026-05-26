@@ -46,6 +46,15 @@ STOP_WAVES_HEX = (
 DEFAULT_CONFIG = "pycollect_gui_config.json"
 
 
+def _get_config_dir() -> Path:
+    """Return the config/ directory for both script and PyInstaller bundle modes."""
+    if getattr(sys, "frozen", False):
+        # PyInstaller one-file bundle: config data landed under _MEIPASS/config
+        return Path(sys._MEIPASS) / "config"  # type: ignore[attr-defined]
+    # Normal script mode: config/ is one level above code/
+    return Path(__file__).resolve().parent.parent / "config"
+
+
 class SignalConfigError(Exception):
     pass
 
@@ -1301,7 +1310,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _signal_source_paths(self):
         config_path = Path(self.config.get("path", ""))
-        base_dir = Path(__file__).resolve().parent
+        base_dir = _get_config_dir()
         params_path = base_dir / "params5.txt"
         waves_path = base_dir / "waves5.txt"
 
@@ -2682,7 +2691,7 @@ def main():
     )
     args = parser.parse_args()
 
-    base_dir = Path(__file__).resolve().parent
+    base_dir = _get_config_dir()
     cfg_path = args.config.strip() if args.config else None
 
     try:

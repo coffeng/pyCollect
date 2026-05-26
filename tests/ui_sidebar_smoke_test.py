@@ -21,6 +21,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "code"))
+
 from PyQt5 import QtCore, QtWidgets  # noqa: E402
 
 import pycollect_qt_gui as gui  # noqa: E402
@@ -38,7 +40,7 @@ def _expect(cond: bool, msg: str) -> None:
 
 
 def _make_window(debug_stdout: bool = False) -> gui.PyCollectQtWindow:
-    base = Path(__file__).resolve().parent
+    base = Path(__file__).resolve().parent.parent / "config"
     config = gui.load_signal_config(base)
     win = gui.PyCollectQtWindow(
         config=config,

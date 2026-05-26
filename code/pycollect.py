@@ -618,7 +618,7 @@ def main():
     )
     parser.add_argument(
         "--config",
-        default="pycollect_gui_config.json",
+        default="config/pycollect_gui_config.json",
         help="Path to JSON config file (for --terminal-simulator mode).",
     )
 

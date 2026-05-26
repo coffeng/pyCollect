@@ -22,42 +22,42 @@ goto :help
 :opt1
 echo [1] Simulator only
 echo Command:
-echo   "%PY%" drc_monitor_simulator.py --drc "%DRC%" --port %SIM_PORT% --wait-command --max-records 3600 --interval 0.02
-"%PY%" drc_monitor_simulator.py --drc "%DRC%" --port %SIM_PORT% --wait-command --max-records 3600 --interval 0.02
+echo   "%PY%" code\drc_monitor_simulator.py --drc "%DRC%" --port %SIM_PORT% --wait-command --max-records 3600 --interval 0.02
+"%PY%" code\drc_monitor_simulator.py --drc "%DRC%" --port %SIM_PORT% --wait-command --max-records 3600 --interval 0.02
 goto :eof
 
 :opt2
 echo [2] Qt GUI collector only
 echo Command:
-echo   "%PY%" pycollect.py --qt-gui %GUI_PORT% --output record.drc --simulation-mode
-"%PY%" pycollect.py --qt-gui %GUI_PORT% --output record.drc --simulation-mode
+echo   "%PY%" code\pycollect.py --qt-gui %GUI_PORT% --output output\record.drc --simulation-mode
+"%PY%" code\pycollect.py --qt-gui %GUI_PORT% --output output\record.drc --simulation-mode
 goto :eof
 
 :opt3
 echo [3] Simulator loop + Qt GUI (auto-stop simulator after GUI exits)
 echo Command:
 echo   powershell -NoProfile -ExecutionPolicy Bypass -Command "...Start-Process simulator...; run gui; stop simulator"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$py='%PY%'; $sim = Start-Process -FilePath $py -ArgumentList 'drc_monitor_simulator.py --drc \"%DRC%\" --port %SIM_PORT% --wait-command --max-records 3600 --interval 0.02 --loop' -PassThru -WorkingDirectory '%ROOT%'; & $py pycollect.py --qt-gui %GUI_PORT% --output record.drc --simulation-mode; if (Get-Process -Id $sim.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $sim.Id -Force }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$py='%PY%'; $sim = Start-Process -FilePath $py -ArgumentList 'code\drc_monitor_simulator.py --drc \"%DRC%\" --port %SIM_PORT% --wait-command --max-records 3600 --interval 0.02 --loop' -PassThru -WorkingDirectory '%ROOT%'; & $py code\pycollect.py --qt-gui %GUI_PORT% --output output\record.drc --simulation-mode; if (Get-Process -Id $sim.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $sim.Id -Force }"
 goto :eof
 
 :opt4
-echo [4] Convert DRC files in current folder to CSV
+echo [4] Convert DRC files in output folder to CSV
 echo Command:
-echo   "%PY%" drc_2_csv.py "%ROOT%" "%ROOT%params5.txt" "%ROOT%waves5.txt"
-"%PY%" drc_2_csv.py "%ROOT%" "%ROOT%params5.txt" "%ROOT%waves5.txt"
+echo   "%PY%" code\drc_2_csv.py "%ROOT%output" "%ROOT%config\params5.txt" "%ROOT%config\waves5.txt"
+"%PY%" code\drc_2_csv.py "%ROOT%output" "%ROOT%config\params5.txt" "%ROOT%config\waves5.txt"
 goto :eof
 
 :opt5
 echo [5] Qt GUI collector from real monitor (COM5)
 echo Command:
-echo   "%PY%" pycollect.py --qt-gui COM5 --output record.drc
-"%PY%" pycollect.py --qt-gui COM5 --output record.drc
+echo   "%PY%" code\pycollect.py --qt-gui COM5 --output output\record.drc
+"%PY%" code\pycollect.py --qt-gui COM5 --output output\record.drc
 goto :eof
 
 :opt6
 echo [6] Terminal-only simulator mode (headless, JSON waveforms, prints to terminal, saves DRC)
 echo Command:
-echo   "%PY%" pycollect.py --terminal-simulator %GUI_PORT% --duration 60 --config pycollect_gui_config.json --output record.drc
+echo   "%PY%" code\pycollect.py --terminal-simulator %GUI_PORT% --duration 60 --config config\pycollect_gui_config.json --output output\record.drc
 "%PY%" pycollect.py --terminal-simulator %GUI_PORT% --duration 60 --config pycollect_gui_config.json --output record.drc
 goto :eof
 
