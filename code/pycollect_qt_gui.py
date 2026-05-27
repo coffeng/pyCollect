@@ -1373,6 +1373,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         self.current_output_file = ""
         self.current_file_state = "default"
+        self.review_mode = False
+        self.review_file_path = ""
+        self.review_records = []
+        self.review_record_index = 0
+        self.review_trend_history_by_row = {}
+        self.review_wave_history_by_id = {}
+        self.review_first_header_utc = None
+        self.review_last_header_utc = None
         self.csv_worker = None
         self.csv_convert_in_progress = False
         self.invalid_detected_total = 0
@@ -1421,6 +1429,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self._apply_pcs_theme()
         self._build_ui()
         self._connect_signals()
+        self._set_capture_button_state("idle")
         self._restore_lock_state()
         self.refresh_ports()
 
@@ -1437,7 +1446,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         if self.simulation_mode and self.autostart:
             self.conn_section.toggle_btn.setChecked(False)
-            self.capture_section.toggle_btn.setChecked(False)
 
         if autostart and initial_port:
             QtCore.QTimer.singleShot(0, self.start_capture)
@@ -1786,6 +1794,14 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if not self.csv_convert_in_progress:
             self._set_convert_button_progress(None)
 
+        can_review = (
+            state == "green"
+            and bool(self.current_output_file)
+            and Path(self.current_output_file).exists()
+            and not self._is_capture_running()
+        )
+        self.review_btn.setEnabled(can_review)
+
     def _set_convert_button_progress(self, percent):
         if percent is None:
             self.convert_csv_btn.setText("Convert Current DRC to CSV")
@@ -1830,6 +1846,252 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.convert_saved_header.setVisible(True)
         self.convert_saved_list.setVisible(True)
+
+    def _clear_review_state(self):
+        self.review_mode = False
+        self.review_file_path = ""
+        self.review_records = []
+        self.review_record_index = 0
+        self.review_trend_history_by_row = {}
+        self.review_wave_history_by_id = {}
+        self.review_first_header_utc = None
+        self.review_last_header_utc = None
+        self.review_row_widget.setVisible(False)
+        self.review_slider.blockSignals(True)
+        self.review_slider.setMinimum(0)
+        self.review_slider.setMaximum(0)
+        self.review_slider.setValue(0)
+        self.review_slider.blockSignals(False)
+        self.review_slider_value_label.setText("--")
+
+    def _clear_runtime_buffers(self):
+        self.logical_now_sec = 0.0
+        self.first_record_header_utc = None
+        self.last_record_header_utc = None
+        self.wave_last_seen_monotonic.clear()
+        self.wave_last_seen_by_row.clear()
+        self.wave_user_unrequested_rows.clear()
+        self.capture_started_monotonic = time.monotonic()
+        self.last_alarm_text = "none"
+        self.last_alarm_color = None
+        self.last_alarm_seen_monotonic = None
+        self.trend_history_by_row.clear()
+        self.review_btn.setEnabled(False)
+        for values in self.trend_buffers.values():
+            values.clear()
+        for values in self.wave_buffers.values():
+            values.clear()
+        for key in self.wave_cursors:
+            self.wave_cursors[key] = None
+
+    def _build_review_parser(self):
+        review_wave_defs = []
+        for item in self.all_wave_defs:
+            cloned = dict(item)
+            cloned["id"] = f"w_{int(item['row_identifier'])}"
+            review_wave_defs.append(cloned)
+        return CollectorWorker(
+            port="",
+            duration_sec=0,
+            all_trend_defs=self.all_trend_defs,
+            all_wave_defs=self.all_wave_defs,
+            trend_defs=self.trend_defs,
+            wave_defs=review_wave_defs,
+            baudrate=int(self.baud_combo.currentText() or "19200"),
+            output_name=self.output_name,
+            simulation_mode=True,
+            no_rtscts=True,
+        )
+
+    def _load_review_dataset(self, file_path):
+        parser = self._build_review_parser()
+        trend_history = {}
+        wave_history = {
+            f"w_{int(item['row_identifier'])}": []
+            for item in self.all_wave_defs
+        }
+        wave_cursors = {key: None for key in wave_history.keys()}
+        wave_meta_by_id = {
+            f"w_{int(item['row_identifier'])}": item
+            for item in self.all_wave_defs
+        }
+        records = []
+        first_header_utc = None
+        last_header_utc = None
+        last_alarm_text = "none"
+        last_alarm_color = None
+
+        with Path(file_path).open("rb") as fp:
+            rec_idx = 0
+            while True:
+                header = fp.read(40)
+                if len(header) < 40:
+                    break
+                r_len = struct.unpack_from("<h", header, 0)[0]
+                if r_len < 40:
+                    break
+                body = fp.read(r_len - 40)
+                if len(body) < (r_len - 40):
+                    break
+                rec_idx += 1
+                record_data = header + body
+                payload = parser._extract_from_record(record_data)
+                rel_t = float(rec_idx - 1)
+
+                header_dt = None
+                record_time_unix = payload.get("record_time_unix")
+                if record_time_unix is not None:
+                    try:
+                        header_dt = datetime.fromtimestamp(
+                            float(record_time_unix),
+                            tz=timezone.utc,
+                        )
+                    except Exception:
+                        header_dt = None
+                if header_dt is not None:
+                    if first_header_utc is None:
+                        first_header_utc = header_dt
+                    last_header_utc = header_dt
+
+                trends_invalid = set(payload.get("trends_invalid", []))
+                trend_rows = payload.get("trend_rows", {}) or {}
+                for row_key, value in trend_rows.items():
+                    if value is None or math.isnan(value):
+                        continue
+                    row_id = int(row_key)
+                    history = trend_history.setdefault(row_id, [])
+                    history.append(
+                        (rel_t, float(value), f"t_{row_id}" in trends_invalid)
+                    )
+
+                waves = payload.get("waves", {}) or {}
+                waves_invalid = payload.get("waves_invalid", {}) or {}
+                for chan_id, samples in waves.items():
+                    if not samples:
+                        continue
+                    meta = wave_meta_by_id.get(chan_id)
+                    if meta is None:
+                        continue
+                    sample_period = 1.0 / max(1.0, float(meta["sample_hz"]))
+                    if wave_cursors[chan_id] is None:
+                        wave_cursors[chan_id] = rel_t
+                    invalid_flags = waves_invalid.get(chan_id, [])
+                    for idx, sample in enumerate(samples):
+                        t_val = wave_cursors[chan_id]
+                        wave_cursors[chan_id] += sample_period
+                        invalid_flag = False
+                        if idx < len(invalid_flags):
+                            invalid_flag = bool(invalid_flags[idx])
+                        wave_history[chan_id].append(
+                            (t_val, float(sample), invalid_flag)
+                        )
+
+                alarm_items = payload.get("alarms", []) or []
+                if alarm_items:
+                    alarm_texts = []
+                    alarm_color = None
+                    for item in alarm_items[:5]:
+                        if isinstance(item, dict):
+                            text = str(item.get("text", "")).strip()
+                            color = item.get("color")
+                        else:
+                            text = str(item).strip()
+                            color = None
+                        if not text:
+                            continue
+                        alarm_texts.append(text)
+                        if alarm_color is None and isinstance(color, int):
+                            alarm_color = color
+                    if alarm_texts:
+                        last_alarm_text = " | ".join(alarm_texts[:5])
+                        last_alarm_color = alarm_color
+
+                records.append(
+                    {
+                        "start_time": rel_t,
+                        "record_header_utc": header_dt,
+                        "alarm_text": last_alarm_text,
+                        "alarm_color": last_alarm_color,
+                    }
+                )
+
+        if not records:
+            raise RuntimeError("No DRC records found in review file")
+
+        return {
+            "records": records,
+            "trend_history": trend_history,
+            "wave_history": wave_history,
+            "first_header_utc": first_header_utc,
+            "last_header_utc": last_header_utc,
+        }
+
+    @staticmethod
+    def _build_review_series(points, start_sec, window_sec, gap_sec=1.0):
+        end_sec = start_sec + window_sec
+        x_vals = []
+        y_vals = []
+        invalid_vals = []
+        prev_t = None
+        for t_val, y_val, invalid_flag in points:
+            if t_val < start_sec:
+                continue
+            if t_val > end_sec:
+                break
+            if prev_t is not None and (t_val - prev_t) > gap_sec:
+                x_vals.append(float("nan"))
+                y_vals.append(float("nan"))
+                invalid_vals.append(False)
+            x_vals.append(t_val - start_sec)
+            y_vals.append(y_val)
+            invalid_vals.append(bool(invalid_flag))
+            prev_t = t_val
+        return x_vals, y_vals, invalid_vals
+
+    def _on_review_clicked(self):
+        if self._is_capture_running():
+            self.log("Stop monitoring before opening review")
+            return
+        if not self.current_output_file or not Path(self.current_output_file).exists():
+            self.log("No recorded DRC file available for review")
+            return
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            dataset = self._load_review_dataset(self.current_output_file)
+        except Exception as exc:
+            self.log(f"ERROR: review load failed: {exc}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        self.review_mode = True
+        self.review_file_path = self.current_output_file
+        self.review_records = dataset["records"]
+        self.review_trend_history_by_row = dataset["trend_history"]
+        self.review_wave_history_by_id = dataset["wave_history"]
+        self.review_first_header_utc = dataset["first_header_utc"]
+        self.review_last_header_utc = dataset["last_header_utc"]
+        self.review_row_widget.setVisible(True)
+        self.review_slider.blockSignals(True)
+        self.review_slider.setMinimum(0)
+        self.review_slider.setMaximum(max(0, len(self.review_records) - 1))
+        self.review_slider.setValue(0)
+        self.review_slider.blockSignals(False)
+        self.review_record_index = 0
+        self.log(f"Review opened: {Path(self.review_file_path).name}")
+        self._update_graph_header()
+        self.update_plots(force=True)
+
+    def _on_review_slider_changed(self, value):
+        if not self.review_mode or not self.review_records:
+            return
+        self.review_record_index = max(
+            0,
+            min(int(value), len(self.review_records) - 1),
+        )
+        self._update_graph_header()
+        self.update_plots(force=True)
 
     def _signal_source_paths(self):
         config_path = Path(self.config.get("path", ""))
@@ -1937,7 +2199,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             getattr(self, "file_save_section", None),
             getattr(self, "wave_catalog_section", None),
             getattr(self, "view_section", None),
-            getattr(self, "capture_section", None),
             getattr(self, "signal_section", None),
             getattr(self, "status_section", None),
         ] if s is not None]
@@ -2014,6 +2275,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             f"color:{self._cfg_color('text', 'accent', '#111111')};"
         )
         left.addWidget(title)
+
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.setContentsMargins(0, 0, 0, 0)
+        control_row.setSpacing(6)
+        self.capture_toggle_btn = QtWidgets.QPushButton("START")
+        self.capture_toggle_btn.setMinimumHeight(34)
+        self.capture_toggle_btn.setAutoDefault(True)
+        self.capture_toggle_btn.setDefault(False)
+        self.review_btn = QtWidgets.QPushButton("REVIEW")
+        self.review_btn.setMinimumHeight(34)
+        self.review_btn.setEnabled(False)
+        control_row.addWidget(self.capture_toggle_btn, 1)
+        control_row.addWidget(self.review_btn, 1)
+        left.addLayout(control_row)
 
         def _hint(text):
             label = QtWidgets.QLabel(text)
@@ -2149,22 +2424,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.view_section.content_layout.addWidget(self.ecg_window_spin)
         self.view_section.content_layout.addWidget(
             _hint("Next: select waveforms and start monitoring.")
-        )
-
-        self.capture_section = CollapsibleSection(
-            "Monitoring Control",
-            expanded=True,
-        )
-        left.addWidget(self.capture_section)
-        self.start_btn = QtWidgets.QPushButton("Start Monitoring")
-        self.stop_btn = QtWidgets.QPushButton("Stop Monitoring")
-        self.stop_btn.setAutoDefault(True)
-        self.stop_btn.setDefault(False)
-        self.stop_btn.setEnabled(False)
-        self.capture_section.content_layout.addWidget(self.start_btn)
-        self.capture_section.content_layout.addWidget(self.stop_btn)
-        self.capture_section.content_layout.addWidget(
-            _hint("Start to begin bedside recording.")
         )
 
         self.signal_section = CollapsibleSection("Trends Selection", expanded=True)
@@ -2409,6 +2668,25 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         top_row.addWidget(self.elapsed_label, 0)
         top_row.addWidget(self.recent_waves_label, 1)
         header_layout.addLayout(top_row)
+
+        review_row = QtWidgets.QHBoxLayout()
+        review_row.setContentsMargins(0, 0, 0, 0)
+        review_row.setSpacing(8)
+        self.review_slider_title_label = QtWidgets.QLabel("Review Start")
+        self.review_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.review_slider.setMinimum(0)
+        self.review_slider.setMaximum(0)
+        self.review_slider.setSingleStep(1)
+        self.review_slider.setPageStep(10)
+        self.review_slider_value_label = QtWidgets.QLabel("--")
+        self.review_slider_value_label.setMinimumWidth(180)
+        review_row.addWidget(self.review_slider_title_label, 0)
+        review_row.addWidget(self.review_slider, 1)
+        review_row.addWidget(self.review_slider_value_label, 0)
+        self.review_row_widget = QtWidgets.QWidget()
+        self.review_row_widget.setLayout(review_row)
+        self.review_row_widget.setVisible(False)
+        header_layout.addWidget(self.review_row_widget, 0)
         header_layout.addWidget(self.recent_alarm_label, 0)
 
         self.graph_panel = QtWidgets.QWidget()
@@ -2423,12 +2701,39 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         self.refresh_ports_btn.clicked.connect(self.refresh_ports)
-        self.start_btn.clicked.connect(self.start_capture)
-        self.stop_btn.clicked.connect(self.stop_capture)
+        self.capture_toggle_btn.clicked.connect(self._on_capture_toggle_clicked)
+        self.review_btn.clicked.connect(self._on_review_clicked)
+        self.review_slider.valueChanged.connect(self._on_review_slider_changed)
         self.hr_window_spin.valueChanged.connect(self.update_plots)
         self.ecg_window_spin.valueChanged.connect(self.update_plots)
         self.graph_splitter.splitterMoved.connect(self.on_splitter_moved)
         self.duration_spin.valueChanged.connect(self._save_runtime_config)
+
+    def _set_capture_button_state(self, state):
+        if state == "recording":
+            self.capture_toggle_btn.setText("STOP")
+            self.capture_toggle_btn.setStyleSheet(
+                self._wave_button_style_for_state("red")
+            )
+            self.capture_toggle_btn.setDefault(True)
+        elif state == "armed":
+            self.capture_toggle_btn.setText("START")
+            self.capture_toggle_btn.setStyleSheet(
+                self._wave_button_style_for_state("green")
+            )
+            self.capture_toggle_btn.setDefault(False)
+        else:
+            self.capture_toggle_btn.setText("START")
+            self.capture_toggle_btn.setStyleSheet(
+                self._wave_button_style_for_state("blue")
+            )
+            self.capture_toggle_btn.setDefault(False)
+
+    def _on_capture_toggle_clicked(self):
+        if self._is_capture_running():
+            self.stop_capture()
+        else:
+            self.start_capture()
 
     def _prepare_selector_popups(self):
         pass  # Trend selection is now embedded in the Signal Setup sidebar section.
@@ -2727,23 +3032,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.log("Capture already running")
             return
 
-        self.logical_now_sec = 0.0
-        self.first_record_header_utc = None
-        self.last_record_header_utc = None
-        self.wave_last_seen_monotonic.clear()
-        self.wave_last_seen_by_row.clear()
-        self.wave_user_unrequested_rows.clear()
-        self.capture_started_monotonic = time.monotonic()
-        self.last_alarm_text = "none"
-        self.last_alarm_color = None
-        self.last_alarm_seen_monotonic = None
-        self.trend_history_by_row.clear()
-        for values in self.trend_buffers.values():
-            values.clear()
-        for values in self.wave_buffers.values():
-            values.clear()
-        for key in self.wave_cursors:
-            self.wave_cursors[key] = None
+        self._clear_review_state()
+        self._clear_runtime_buffers()
         self.update_plots(force=True)
 
         duration = self.duration_spin.value()
@@ -2772,9 +3062,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.error_signal.connect(self.on_error)
 
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.stop_btn.setDefault(True)
+        self._set_capture_button_state("armed")
 
         wave_fs_log = ", ".join(
             [
@@ -2792,6 +3080,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def on_file_status(self, state, output_file):
         if state == "appending":
             self._set_file_save_status("blue", output_file)
+            self._set_capture_button_state("recording")
             self.log(f"Appending to: {Path(output_file).name}")
             return
         if state == "closed":
@@ -2824,15 +3113,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if unlocked:
             self.log("Unlocked sections. Use Stop Monitoring before closing.")
 
-        try:
-            if not self.capture_section.toggle_btn.isChecked():
-                self.capture_section.toggle_btn.setChecked(True)
-        except Exception:
-            pass
-
-        if self.stop_btn.isEnabled():
-            self.stop_btn.setDefault(True)
-            self.stop_btn.setFocus(QtCore.Qt.ActiveWindowFocusReason)
+        if self._is_capture_running():
+            self.capture_toggle_btn.setDefault(True)
+            self.capture_toggle_btn.setFocus(
+                QtCore.Qt.ActiveWindowFocusReason
+            )
             self.log(
                 "Monitoring is active. Press Enter on Stop Monitoring first."
             )
@@ -3049,6 +3334,70 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.update_plots()
 
     def _update_graph_header(self):
+        if self.review_mode and self.review_records:
+            info = self.review_records[self.review_record_index]
+            record_dt = info.get("record_header_utc")
+            if record_dt is None:
+                self.last_record_label.setText(
+                    f"Review start (record): {self.review_record_index + 1}"
+                )
+            else:
+                self.last_record_label.setText(
+                    "Review start (header UTC): "
+                    f"{record_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+            start_sec = float(info.get("start_time", 0.0))
+            hh = int(start_sec) // 3600
+            mm = (int(start_sec) % 3600) // 60
+            ss = int(start_sec) % 60
+            self.elapsed_label.setText(
+                "Review offset: "
+                f"{hh:02d}:{mm:02d}:{ss:02d} "
+                f"({self.review_record_index + 1}/{len(self.review_records)})"
+            )
+
+            _trend_window, wave_window = self._effective_windows()
+            end_sec = start_sec + wave_window
+            row_to_label = {
+                int(item["row_identifier"]): item["label"]
+                for item in self.all_wave_defs
+            }
+            recent_wave_labels = []
+            for item in self.all_wave_defs:
+                chan_id = f"w_{int(item['row_identifier'])}"
+                points = self.review_wave_history_by_id.get(chan_id, [])
+                for t_val, _sample, _invalid in points:
+                    if t_val < start_sec:
+                        continue
+                    if t_val > end_sec:
+                        break
+                    recent_wave_labels.append(
+                        row_to_label.get(int(item["row_identifier"]), "")
+                    )
+                    break
+            recent_wave_labels = [label for label in recent_wave_labels if label]
+            waves_text = ", ".join(recent_wave_labels) if recent_wave_labels else "none"
+            self.recent_waves_label.setText(
+                f"Waveforms (review window): {waves_text}"
+            )
+
+            alarm_text = str(info.get("alarm_text") or "none")
+            alarm_css = self._alarm_color_css(info.get("alarm_color"))
+            if alarm_text == "none":
+                alarm_css = self._cfg_color("text", "secondary", "#9aa0a6")
+            self.recent_alarm_label.setText(f"Alarm: {alarm_text}")
+            self.recent_alarm_label.setStyleSheet(
+                "font-weight: 600;"
+                f"color:{alarm_css};"
+            )
+
+            slider_text = f"{self.review_record_index + 1}/{len(self.review_records)}"
+            if record_dt is not None:
+                slider_text += f"  {record_dt.strftime('%H:%M:%S')}"
+            self.review_slider_value_label.setText(slider_text)
+            return
+
         if self.last_record_header_utc is None:
             self.last_record_label.setText("Last record (header UTC): --")
         else:
@@ -3170,6 +3519,108 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         return x_vals, y_vals, invalid_vals
 
     def update_plots(self, force=False):
+        if self.review_mode and self.review_records:
+            trend_window, wave_window = self._effective_windows()
+            start_sec = float(
+                self.review_records[self.review_record_index].get(
+                    "start_time",
+                    0.0,
+                )
+            )
+
+            for item in self.trend_defs:
+                if item["id"] not in self.trend_curves:
+                    continue
+                row_id = int(item["row_identifier"])
+                points = self.review_trend_history_by_row.get(row_id, [])
+                x_data, y_data, invalid_data = self._build_review_series(
+                    points,
+                    start_sec,
+                    trend_window,
+                    gap_sec=1.0,
+                )
+                y_valid = []
+                y_invalid = []
+                latest = None
+                latest_invalid = False
+                for value, inv in zip(y_data, invalid_data):
+                    if isinstance(value, float) and math.isnan(value):
+                        y_valid.append(value)
+                        y_invalid.append(value)
+                        continue
+                    latest = value
+                    latest_invalid = bool(inv)
+                    if inv:
+                        y_valid.append(float("nan"))
+                        y_invalid.append(0.0)
+                    else:
+                        y_valid.append(value)
+                        y_invalid.append(float("nan"))
+                self.trend_curves[item["id"]].setData(x_data, y_valid)
+                self.trend_invalid_curves[item["id"]].setData(x_data, y_invalid)
+                if latest is None:
+                    self.trend_plots[item["id"]].setTitle(item["title"])
+                elif latest_invalid:
+                    self.trend_plots[item["id"]].setTitle(
+                        f"{item['title']} : DATA_INVALID"
+                    )
+                else:
+                    fmt = (
+                        f"{latest:.0f}"
+                        if latest == round(latest)
+                        else f"{latest:.1f}"
+                    )
+                    self.trend_plots[item["id"]].setTitle(
+                        f"{item['title']} : {fmt}"
+                    )
+                self.trend_plots[item["id"]].setXRange(
+                    0,
+                    trend_window,
+                    padding=0.0,
+                )
+
+            for item in self.wave_defs:
+                if item["id"] not in self.wave_curves:
+                    continue
+                points = self.review_wave_history_by_id.get(item["id"], [])
+                x_data, y_data, invalid_data = self._build_review_series(
+                    points,
+                    start_sec,
+                    wave_window,
+                    gap_sec=1.0,
+                )
+                y_valid = []
+                y_invalid = []
+                latest_invalid = False
+                has_wave = False
+                for value, inv in zip(y_data, invalid_data):
+                    if isinstance(value, float) and math.isnan(value):
+                        y_valid.append(value)
+                        y_invalid.append(value)
+                        continue
+                    has_wave = True
+                    latest_invalid = bool(inv)
+                    if inv:
+                        y_valid.append(float("nan"))
+                        y_invalid.append(0.0)
+                    else:
+                        y_valid.append(value)
+                        y_invalid.append(float("nan"))
+                self.wave_curves[item["id"]].setData(x_data, y_valid)
+                self.wave_invalid_curves[item["id"]].setData(x_data, y_invalid)
+                if has_wave and latest_invalid:
+                    self.wave_plots[item["id"]].setTitle(
+                        f"{item['title']} : DATA_INVALID"
+                    )
+                else:
+                    self.wave_plots[item["id"]].setTitle(item["title"])
+                self.wave_plots[item["id"]].setXRange(
+                    0,
+                    wave_window,
+                    padding=0.0,
+                )
+            return
+
         trend_window, wave_window = self._effective_windows()
         now_rel = float(self.logical_now_sec)
 
@@ -3290,18 +3741,16 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.sim_idle_timer.stop()
         self.capture_started_monotonic = None
         self.log(f"Capture finished. Saved: {output_file}")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setDefault(False)
+        self._set_capture_button_state("idle")
+        if self.current_output_file and Path(self.current_output_file).exists():
+            self.review_btn.setEnabled(True)
         self._allow_close_during_capture = False
 
     def on_error(self, error_message):
         self.sim_idle_timer.stop()
         self.capture_started_monotonic = None
         self.log(f"ERROR: {error_message}")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setDefault(False)
+        self._set_capture_button_state("idle")
         self._allow_close_during_capture = False
 
     def _on_simulation_idle_timeout(self):
