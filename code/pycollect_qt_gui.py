@@ -1261,7 +1261,7 @@ class CsvConversionWorker(QtCore.QThread):
                     pct = 45
                 self.progress_signal.emit(pct, int(processed), int(total))
 
-            trend_df, wave_df, freq, pacer_info_list = (
+            trend_df, wave_df, freq, pacer_info_list, alarms_df = (
                 drc_2_csv.process_drc_file(
                     str(self.drc_path),
                     params_df,
@@ -1307,6 +1307,17 @@ class CsvConversionWorker(QtCore.QThread):
                     "_pacers.csv",
                 )
                 saved_paths.append(pacer_csv_path)
+
+            if alarms_df is not None and len(alarms_df) > 0:
+                drc_2_csv.save_alarms_to_csv(
+                    alarms_df,
+                    str(self.drc_path),
+                )
+                alarms_csv_path = str(self.drc_path).replace(
+                    ".drc",
+                    "_alarms.csv",
+                )
+                saved_paths.append(alarms_csv_path)
 
             self.progress_signal.emit(100, total_records, total_records)
             self.finished_signal.emit(saved_paths)
