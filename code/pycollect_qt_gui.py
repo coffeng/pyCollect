@@ -8,6 +8,7 @@ import struct
 import sys
 import threading
 import time
+import textwrap
 import traceback
 from collections import deque
 from datetime import datetime, timezone
@@ -393,6 +394,12 @@ def load_signal_config(config_path=None):
 
     ui_cfg = raw_cfg.get("ui", {})
     conn_cfg = ui_cfg.get("connection", {})
+    initial_output_directory = str(
+        ui_cfg.get("output_directory", "")
+    ).strip()
+    initial_output_filename = str(
+        ui_cfg.get("output_filename", "")
+    ).strip()
     initial_duration = int(ui_cfg.get("duration_sec", 60))
     initial_trend_window = float(ui_cfg.get("trend_window_sec", 60))
     initial_wave_window = float(ui_cfg.get("wave_window_sec", 10))
@@ -418,6 +425,8 @@ def load_signal_config(config_path=None):
         "initial_trend_window": max(10.0, initial_trend_window),
         "initial_wave_window": max(10.0, initial_wave_window),
         "initial_baudrate": initial_baudrate,
+        "initial_output_directory": initial_output_directory,
+        "initial_output_filename": initial_output_filename,
         "initial_sim_speed": max(
             0.05,
             min(1000.0, initial_sim_speed),
@@ -1124,6 +1133,13 @@ class CollectorWorker(QtCore.QThread):
         package_counter = 0
         try:
             output_file = pycollect.build_output_filename(self.output_name)
+            resolved_output = pycollect.resolve_non_overwriting_path(output_file)
+            if str(resolved_output) != str(output_file):
+                self.status_signal.emit(
+                    "Output exists, using timestamped file: "
+                    + str(Path(resolved_output).name)
+                )
+            output_file = str(resolved_output)
             output_fp = open(output_file, "wb")
             self.file_status_signal.emit("appending", output_file)
 
@@ -1405,6 +1421,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.all_trend_defs = config["all_trend_defs"]
         self.all_wave_defs = config["all_wave_defs"]
         self.output_name = output_name
+        self.output_directory = ""
+        self.output_filename = ""
         self.autostart = autostart
         self.simulation_mode = simulation_mode
         self.debug_stdout = debug_stdout
@@ -1494,6 +1512,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.invalid_pen = pg.mkPen("#9aa0a6", width=2)
 
+        self._init_output_target()
+
         self._apply_pcs_theme()
         self._build_ui()
         self._connect_signals()
@@ -1537,6 +1557,83 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             logger=self.log,
         )
         self.control_server.start()
+
+    def _default_output_directory(self):
+        cfg_dir = Path(self.config.get("config_dir", "") or Path.cwd())
+        return str((cfg_dir / "output").resolve())
+
+    @staticmethod
+    def _wrap_sidebar_text(text, width=42):
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        return "\n".join(
+            textwrap.wrap(
+                value,
+                width=max(16, int(width)),
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+        )
+
+    def _normalized_output_filename(self, name):
+        text = str(name or "").strip()
+        if not text:
+            text = "record.drc"
+        root, ext = os.path.splitext(text)
+        if not ext:
+            text = text + ".drc"
+        return Path(text).name
+
+    def _init_output_target(self):
+        raw = str(self.output_name or "").strip()
+        cfg_dir = str(self.config.get("initial_output_directory", "") or "").strip()
+        cfg_name = str(self.config.get("initial_output_filename", "") or "").strip()
+
+        if raw:
+            out_path = Path(raw)
+            if not out_path.is_absolute():
+                out_path = (Path.cwd() / out_path).resolve()
+            self.output_directory = str(out_path.parent)
+            self.output_filename = self._normalized_output_filename(out_path.name)
+        else:
+            self.output_directory = cfg_dir or self._default_output_directory()
+            self.output_filename = self._normalized_output_filename(cfg_name)
+
+        self.output_name = str(
+            Path(self.output_directory) / self.output_filename
+        )
+
+    def _sync_output_target_from_inputs(self):
+        folder = str(self.save_folder_edit.text() or "").strip()
+        if not folder:
+            folder = self._default_output_directory()
+        filename = self._normalized_output_filename(self.save_filename_edit.text())
+
+        self.output_directory = folder
+        self.output_filename = filename
+        self.output_name = str(Path(folder) / filename)
+        self.save_target_preview_label.setText(
+            self._wrap_sidebar_text(self.output_name)
+        )
+        self.save_target_preview_label.setToolTip(self.output_name)
+
+    def _on_browse_output_folder(self):
+        start_dir = str(self.save_folder_edit.text() or "").strip()
+        if not start_dir:
+            start_dir = self._default_output_directory()
+        selected = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select output folder",
+            start_dir,
+        )
+        if not selected:
+            return
+        self.save_folder_edit.setText(selected)
+
+    def _on_output_target_edited(self):
+        self._sync_output_target_from_inputs()
+        self._save_runtime_config()
 
     def _cfg_color(self, section, key, fallback):
         section_data = self.colors.get(section, {})
@@ -1842,7 +1939,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             text = Path(self.current_output_file).name
 
         bg, fg = self._save_state_colors(state)
-        self.save_file_name_label.setText(text)
+        self.save_file_name_label.setText(
+            self._wrap_sidebar_text(text, width=34)
+        )
         self.save_file_name_label.setToolTip(self.current_output_file)
         self.save_file_name_label.setStyleSheet(
             "padding:6px;border-radius:4px;"
@@ -2451,10 +2550,50 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         left.addWidget(self.file_save_section)
         self.file_save_section.content_layout.addWidget(
+            QtWidgets.QLabel("Save Folder")
+        )
+        save_folder_row = QtWidgets.QHBoxLayout()
+        save_folder_row.setContentsMargins(0, 0, 0, 0)
+        save_folder_row.setSpacing(6)
+        self.save_folder_edit = QtWidgets.QLineEdit()
+        self.save_folder_edit.setPlaceholderText("Select folder")
+        self.save_folder_browse_btn = QtWidgets.QPushButton("Browse...")
+        save_folder_row.addWidget(self.save_folder_edit, 1)
+        save_folder_row.addWidget(self.save_folder_browse_btn, 0)
+        self.file_save_section.content_layout.addLayout(save_folder_row)
+
+        self.file_save_section.content_layout.addWidget(
+            QtWidgets.QLabel("Save Filename")
+        )
+        self.save_filename_edit = QtWidgets.QLineEdit()
+        self.save_filename_edit.setPlaceholderText("record.drc")
+        self.file_save_section.content_layout.addWidget(self.save_filename_edit)
+
+        self.file_save_section.content_layout.addWidget(
+            QtWidgets.QLabel("Planned Save Path")
+        )
+        self.save_target_preview_label = QtWidgets.QLabel("")
+        self.save_target_preview_label.setWordWrap(True)
+        self.save_target_preview_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        self.save_target_preview_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.file_save_section.content_layout.addWidget(
+            self.save_target_preview_label
+        )
+
+        self.file_save_section.content_layout.addWidget(
             QtWidgets.QLabel("Current DRC File")
         )
         self.save_file_name_label = QtWidgets.QLabel("No output file")
         self.save_file_name_label.setWordWrap(True)
+        self.save_file_name_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.save_file_name_label.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
@@ -2494,6 +2633,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.file_save_section.content_layout.addWidget(
             _hint("Blue: appending. Green: closed and ready to convert.")
         )
+        self.save_folder_edit.setText(self.output_directory)
+        self.save_filename_edit.setText(self.output_filename)
+        self._sync_output_target_from_inputs()
         self._set_file_save_status("default", "")
 
         self.view_section = CollapsibleSection(
@@ -2812,6 +2954,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.ecg_window_spin.valueChanged.connect(self.update_plots)
         self.graph_splitter.splitterMoved.connect(self.on_splitter_moved)
         self.duration_spin.valueChanged.connect(self._save_runtime_config)
+        self.save_folder_browse_btn.clicked.connect(self._on_browse_output_folder)
+        self.save_folder_edit.editingFinished.connect(self._on_output_target_edited)
+        self.save_filename_edit.editingFinished.connect(self._on_output_target_edited)
 
     def _set_capture_button_state(self, state):
         if state == "recording":
@@ -3135,6 +3280,22 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.log("Capture already running")
             return
+
+        self._sync_output_target_from_inputs()
+        target_file = Path(self.output_name)
+        try:
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.log(f"ERROR: cannot create output folder: {exc}")
+            return
+        if target_file.exists():
+            resolved = pycollect.resolve_non_overwriting_path(target_file)
+            self.save_filename_edit.setText(Path(resolved).name)
+            self._sync_output_target_from_inputs()
+            self.log(
+                "Target file exists; using timestamped filename: "
+                + Path(self.output_name).name
+            )
 
         self._clear_review_state()
         self._clear_runtime_buffers()
@@ -4016,6 +4177,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         data["ui"]["duration_sec"] = int(self.duration_spin.value())
         data["ui"]["trend_window_sec"] = int(self.hr_window_spin.value())
         data["ui"]["wave_window_sec"] = float(self.ecg_window_spin.value())
+        data["ui"]["output_directory"] = str(self.output_directory)
+        data["ui"]["output_filename"] = str(self.output_filename)
         data["ui"]["connection"]["baudrate"] = int(
             self.baud_combo.currentText() or "19200"
         )

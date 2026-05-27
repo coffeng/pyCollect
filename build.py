@@ -1,12 +1,16 @@
 """
-build.py  —  Build pyCollect.exe with PyInstaller
-=================================================
+build.py  —  Build pyCollect GUI + CLI executables with PyInstaller
+===================================================================
 Usage:
-    python build.py            # increments build number, builds exe
+    python build.py            # increments build number,
+                              # builds GUI + CLI variants
     python build.py --no-sign  # skip code signing prompt
 
 Produces:
-    dist/pyCollect.exe         standalone Windows executable
+    dist/pyCollect.exe         standalone Windows GUI executable
+                              (no console window)
+    dist/pyCollect-cli.exe     standalone Windows console executable
+                              (headless/CLI)
     pyCollect_Setup.exe        Inno Setup installer (if ISCC is on PATH)
 
 Requires:
@@ -17,12 +21,10 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import os
 import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent.absolute()
@@ -30,11 +32,11 @@ DIST_DIR = ROOT / "dist"
 BUILD_DIR = ROOT / "build"
 ICON_PATH = ROOT / "assets" / "icon.ico"
 VERSION_FILE = ROOT / "version_info.txt"
-SPEC_FILE = ROOT / "pyCollect.spec"
 MAIN_PY = ROOT / "code" / "pycollect.py"
 ISS_FILE = ROOT / "pyCollect.iss"
 
-APP_NAME = "pyCollect"
+APP_GUI_NAME = "pyCollect"
+APP_CLI_NAME = "pyCollect-cli"
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +88,8 @@ def _write_version(version: str) -> None:
 )
 """
     VERSION_FILE.write_text(content, encoding="utf-8")
-    print(f"Version info written: {version}  ({now.strftime('%Y-%m-%d %H:%M:%S')})")
+    now_text = now.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Version info written: {version}  ({now_text})")
 
 
 # ---------------------------------------------------------------------------
@@ -105,20 +108,20 @@ def _ensure_icon() -> bool:
 # PyInstaller build
 # ---------------------------------------------------------------------------
 
-def _clean_spec() -> None:
-    if SPEC_FILE.exists():
-        SPEC_FILE.unlink()
-        print("Removed old spec file.")
+def _clean_spec(app_name: str) -> None:
+    spec_file = ROOT / f"{app_name}.spec"
+    if spec_file.exists():
+        spec_file.unlink()
+        print(f"Removed old spec file: {spec_file.name}")
 
 
-def _build_exe(has_icon: bool) -> bool:
+def _build_exe(app_name: str, has_icon: bool, windowed: bool) -> bool:
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--clean",
         "--noconfirm",
-        "--windowed",
-        f"--name={APP_NAME}",
+        f"--name={app_name}",
         # Bundle config directory so the frozen app can find signal definitions
         "--add-data=config;config",
         # Bundle assets so Qt can set window/taskbar icon in frozen mode
@@ -152,15 +155,23 @@ def _build_exe(has_icon: bool) -> bool:
         "--exclude-module=matplotlib",
     ]
 
+    if windowed:
+        cmd.append("--windowed")
+
     if has_icon:
         cmd.append(f"--icon={ICON_PATH}")
 
     cmd.append(str(MAIN_PY))
 
-    print(f"\nRunning PyInstaller (entry: {MAIN_PY.relative_to(ROOT)})")
+    mode_label = "GUI/windowed" if windowed else "CLI/console"
+    entry = MAIN_PY.relative_to(ROOT)
+    print(
+        f"\nRunning PyInstaller for {app_name}.exe "
+        f"({mode_label}, entry: {entry})"
+    )
     try:
-        result = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=False)
-        exe = DIST_DIR / f"{APP_NAME}.exe"
+        subprocess.run(cmd, cwd=ROOT, check=True, capture_output=False)
+        exe = DIST_DIR / f"{app_name}.exe"
         if exe.exists():
             size_mb = exe.stat().st_size / 1024 / 1024
             print(f"\nBuild successful: {exe}  ({size_mb:.1f} MB)")
@@ -209,48 +220,68 @@ def _build_installer() -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build pyCollect.exe")
-    parser.add_argument("--no-sign", action="store_true", help="Skip code signing prompt")
-    parser.add_argument("--no-installer", action="store_true", help="Skip Inno Setup step")
-    parser.add_argument("--version", help="Override version number (e.g. 1.2.3)")
+    parser = argparse.ArgumentParser(
+        description="Build pyCollect GUI and CLI executables"
+    )
+    parser.add_argument(
+        "--no-sign", action="store_true", help="Skip code signing prompt"
+    )
+    parser.add_argument(
+        "--no-installer", action="store_true", help="Skip Inno Setup step"
+    )
+    parser.add_argument(
+        "--version", help="Override version number (e.g. 1.2.3)"
+    )
     args = parser.parse_args()
 
     # Version
     prev = _read_version()
     version = args.version if args.version else _increment_version(prev)
     _write_version(version)
-    print(f"Building {APP_NAME} v{version}")
+    print(f"Building {APP_GUI_NAME} variants v{version}")
 
     # Icon
     has_icon = _ensure_icon()
 
-    # Clean old spec
-    _clean_spec()
+    # Clean old specs
+    _clean_spec(APP_GUI_NAME)
+    _clean_spec(APP_CLI_NAME)
 
-    # Build exe
-    if not _build_exe(has_icon):
+    # Build GUI exe from the shared source entry.
+    if not _build_exe(APP_GUI_NAME, has_icon=has_icon, windowed=True):
+        return 1
+
+    # Build CLI exe from the same shared source entry.
+    if not _build_exe(APP_CLI_NAME, has_icon=has_icon, windowed=False):
         return 1
 
     # Optional: sign exe
     if not args.no_sign:
-        exe = DIST_DIR / f"{APP_NAME}.exe"
+        exe_paths = [
+            DIST_DIR / f"{APP_GUI_NAME}.exe",
+            DIST_DIR / f"{APP_CLI_NAME}.exe",
+        ]
         try:
-            resp = input("\nSign pyCollect.exe with signtool? (y/N): ").strip().lower()
+            resp = input(
+                "\nSign pyCollect.exe and pyCollect-cli.exe with signtool? "
+                "(y/N): "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             resp = "n"
         if resp in {"y", "yes"}:
-            sign_cmd = [
-                "signtool", "sign",
-                "/tr", "http://timestamp.digicert.com",
-                "/td", "SHA256",
-                "/fd", "SHA256",
-                str(exe),
-            ]
-            try:
-                subprocess.run(sign_cmd, check=True)
-                print("Signed successfully.")
-            except Exception as exc:
-                print(f"Signing failed: {exc}")
+            for exe in exe_paths:
+                sign_cmd = [
+                    "signtool", "sign",
+                    "/tr", "http://timestamp.digicert.com",
+                    "/td", "SHA256",
+                    "/fd", "SHA256",
+                    str(exe),
+                ]
+                try:
+                    subprocess.run(sign_cmd, check=True)
+                    print(f"Signed successfully: {exe.name}")
+                except Exception as exc:
+                    print(f"Signing failed for {exe.name}: {exc}")
 
     # Build installer
     if not args.no_installer:

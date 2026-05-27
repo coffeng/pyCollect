@@ -6,6 +6,10 @@ This document started as a plan and now also tracks implemented/tested status fo
 
 Configuration and packaging were updated for current simulation/review workflows.
 
+- Build now produces two Windows executables from the same source entry file
+  (`code/pycollect.py`) so GUI and headless workflows stay aligned:
+  - `dist\pyCollect.exe` (GUI/windowed, no persistent cmd window)
+  - `dist\pyCollect-cli.exe` (console/headless, supports `-h` and CLI output)
 - Added comprehensive waveform/trend color dictionaries to the GUI config so
   plot colors resolve by normalized signal key (for example `ECG1`, `P2mean`,
   `NIBPsys`, `SPI`).
@@ -25,12 +29,15 @@ Primary build entry point:
 Build script behavior:
 
 - Increments `version_info.txt` build number unless `--version` is supplied.
-- Builds one-file GUI executable with PyInstaller.
+- Builds two one-file executables from identical source (`code/pycollect.py`):
+  - `pyCollect.exe` as windowed GUI build.
+  - `pyCollect-cli.exe` as console CLI build.
 - Builds installer with Inno Setup (`ISCC`) when available.
 
 Expected outputs:
 
 - `dist\pyCollect.exe`
+- `dist\pyCollect-cli.exe`
 - `pyCollect_Setup.exe`
 
 Useful flags:
@@ -38,6 +45,20 @@ Useful flags:
 - `--no-sign` : skips signtool prompt.
 - `--no-installer` : build exe only.
 - `--version X.Y.Z` : explicit version override.
+
+### GUI vs CLI on Windows
+
+GUI launch (no console window):
+
+```powershell
+dist\pyCollect.exe
+```
+
+CLI/headless help and options:
+
+```powershell
+dist\pyCollect-cli.exe -h
+```
 
 ## Update: 2026-05-26
 

@@ -18,6 +18,7 @@ Name: "{app}\config"
 
 [Files]
 Source: "dist\pyCollect.exe"; DestDir: "{app}"
+Source: "dist\pyCollect-cli.exe"; DestDir: "{app}"
 Source: "README.md"; DestDir: "{app}"
 Source: "assets\icon.ico"; DestDir: "{app}"
 Source: "config\pycollect_gui_config.json"; DestDir: "{app}\config"

@@ -2,6 +2,7 @@ import argparse
 import collections
 import json
 import os
+import re
 import subprocess
 import struct
 import sys
@@ -398,6 +399,32 @@ def _format_monitor_time(value):
     return f"{int(ts)} ({utc_text})"
 
 
+def resolve_non_overwriting_path(path_text):
+    """Return a writable file path without overwriting existing files.
+
+    If the target exists, append `_yyyymmdd_hhmmss` before extension.
+    If stem already ends with that timestamp pattern, replace it.
+    """
+    target = Path(str(path_text or "").strip())
+    if not target.exists():
+        return target
+
+    stem_base = re.sub(r"_\d{8}_\d{6}$", "", target.stem)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = target.with_name(f"{stem_base}_{timestamp}{target.suffix}")
+    if not candidate.exists():
+        return candidate
+
+    index = 1
+    while True:
+        candidate = target.with_name(
+            f"{stem_base}_{timestamp}_{index:02d}{target.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def write_drc_capture_log(
     drc_path,
     pc_start_dt=None,
@@ -524,7 +551,11 @@ def send_hex_command(
 
                 time.sleep(interval)
 
-            filename = build_output_filename(output_name)
+            filename = str(
+                resolve_non_overwriting_path(
+                    build_output_filename(output_name)
+                )
+            )
             with open(filename, "wb") as file:
                 file.write(concatenated_data)
 
@@ -770,7 +801,11 @@ def run_terminal_simulator(
         print(f"Total packages received: {package_index}")
         
         if output_name and concatenated_data:
-            filename = build_output_filename(output_name)
+            filename = str(
+                resolve_non_overwriting_path(
+                    build_output_filename(output_name)
+                )
+            )
             with open(filename, "wb") as file:
                 file.write(concatenated_data)
             print(f"Data saved to {filename} ({len(concatenated_data)} bytes)")
@@ -934,7 +969,18 @@ def main():
 
     args = parser.parse_args()
 
-    if args.qt_gui:
+    launch_qt_gui = (
+        args.qt_gui
+        or (
+            not args.port
+            and not args.stop
+            and not args.gui
+            and not args.blind
+            and not args.terminal_simulator
+        )
+    )
+
+    if launch_qt_gui:
         gui_args = []
         if args.port:
             gui_args.extend(["--port", args.port])
