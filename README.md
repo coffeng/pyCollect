@@ -2,6 +2,43 @@
 
 This document started as a plan and now also tracks implemented/tested status for the current prototype.
 
+## Update: 2026-05-27
+
+Configuration and packaging were updated for current simulation/review workflows.
+
+- Added comprehensive waveform/trend color dictionaries to the GUI config so
+  plot colors resolve by normalized signal key (for example `ECG1`, `P2mean`,
+  `NIBPsys`, `SPI`).
+- Synced runtime config behavior with current launcher flow: option 3 continues
+  using configured simulation speed (no hardcoded max-speed override).
+- Confirmed active runtime config path on Windows remains:
+  `C:\Users\100014430\AppData\Local\pyCollect\pycollect_gui_config.json`.
+
+### Windows EXE + Setup Build
+
+Primary build entry point:
+
+```powershell
+.\.venv\Scripts\python.exe .\build.py --no-sign
+```
+
+Build script behavior:
+
+- Increments `version_info.txt` build number unless `--version` is supplied.
+- Builds one-file GUI executable with PyInstaller.
+- Builds installer with Inno Setup (`ISCC`) when available.
+
+Expected outputs:
+
+- `dist\pyCollect.exe`
+- `pyCollect_Setup.exe`
+
+Useful flags:
+
+- `--no-sign` : skips signtool prompt.
+- `--no-installer` : build exe only.
+- `--version X.Y.Z` : explicit version override.
+
 ## Update: 2026-05-26
 
 Today the simulator and Qt GUI integration was tightened up for the serial-loop

@@ -7,7 +7,7 @@ import struct
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import serial  # pyserial is assumed to be available
@@ -385,6 +385,82 @@ def build_output_filename(output_name=None):
     return cleaned
 
 
+def _format_monitor_time(value):
+    if value is None:
+        return "n/a"
+    try:
+        ts = float(value)
+    except Exception:
+        return str(value)
+    utc_text = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+    return f"{int(ts)} ({utc_text})"
+
+
+def write_drc_capture_log(
+    drc_path,
+    pc_start_dt=None,
+    pc_end_dt=None,
+    monitor_first_unix=None,
+    monitor_last_unix=None,
+    waveforms=None,
+    trend_interval_sec=None,
+    trend_record_count=0,
+    waveform_record_count=0,
+    alarm_record_count=0,
+):
+    """Write sidecar capture summary to '<drc filename>.log'."""
+    drc_text = str(drc_path or "").strip()
+    if not drc_text:
+        return ""
+
+    drc_path_obj = Path(drc_text)
+    if drc_path_obj.suffix:
+        log_path = drc_path_obj.with_suffix(".log")
+    else:
+        log_path = Path(drc_text + ".log")
+
+    start_text = "n/a"
+    end_text = "n/a"
+    if isinstance(pc_start_dt, datetime):
+        start_text = pc_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(pc_end_dt, datetime):
+        end_text = pc_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    waveform_names = [
+        str(item).strip()
+        for item in (waveforms or [])
+        if str(item).strip()
+    ]
+    waveform_text = ", ".join(waveform_names) if waveform_names else "none"
+
+    interval_text = "n/a"
+    if trend_interval_sec is not None:
+        try:
+            interval_text = str(float(trend_interval_sec))
+        except Exception:
+            interval_text = str(trend_interval_sec)
+
+    lines = [
+        (
+            f"pc_start={start_text}, pc_end={end_text}, "
+            f"monitor_first_record={_format_monitor_time(monitor_first_unix)}, "
+            f"monitor_last_record={_format_monitor_time(monitor_last_unix)}"
+        ),
+        f"waveforms={waveform_text}",
+        (
+            f"trend_collection_interval_sec={interval_text}, "
+            f"trend_record_count={int(trend_record_count)}, "
+            f"waveform_record_count={int(waveform_record_count)}, "
+            f"alarm_record_count={int(alarm_record_count)}"
+        ),
+    ]
+
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(log_path)
+
+
 def send_hex_command(
     port,
     command_bytes,
@@ -620,6 +696,12 @@ def run_terminal_simulator(
     )
 
     ser = None
+    pc_start_dt = datetime.now()
+    monitor_first_unix = None
+    monitor_last_unix = None
+    trend_record_count = 0
+    waveform_record_count = 0
+    alarm_record_count = 0
     try:
         ser = serial.Serial(
             port=port,
@@ -651,6 +733,28 @@ def run_terminal_simulator(
 
                 if len(processed_data) > 40:
                     concatenated_data.extend(processed_data)
+
+                    try:
+                        header_fmt = (
+                            "< h b b H I b b H h "
+                            + "h b" * DRI_MAX_SUBRECS
+                        )
+                        header_struct = struct.Struct(header_fmt)
+                        header = header_struct.unpack(processed_data[:40])
+                        r_time = int(header[4])
+                        r_maintype = int(header[8])
+                        if monitor_first_unix is None:
+                            monitor_first_unix = r_time
+                        monitor_last_unix = r_time
+                        if r_maintype == 0:
+                            trend_record_count += 1
+                        elif r_maintype == 1:
+                            waveform_record_count += 1
+                        elif r_maintype == 4:
+                            alarm_record_count += 1
+                    except Exception:
+                        pass
+
                     print_terminal_output(
                         package_index,
                         processed_data,
@@ -670,6 +774,23 @@ def run_terminal_simulator(
             with open(filename, "wb") as file:
                 file.write(concatenated_data)
             print(f"Data saved to {filename} ({len(concatenated_data)} bytes)")
+            try:
+                log_file = write_drc_capture_log(
+                    filename,
+                    pc_start_dt=pc_start_dt,
+                    pc_end_dt=datetime.now(),
+                    monitor_first_unix=monitor_first_unix,
+                    monitor_last_unix=monitor_last_unix,
+                    waveforms=[item.get("label", "") for item in (wave_defs or [])],
+                    trend_interval_sec=None,
+                    trend_record_count=trend_record_count,
+                    waveform_record_count=waveform_record_count,
+                    alarm_record_count=alarm_record_count,
+                )
+                if log_file:
+                    print(f"Capture log saved to {log_file}")
+            except Exception as exc:
+                print(f"Warning: failed to write capture log: {exc}")
         
         print("=" * 60)
 

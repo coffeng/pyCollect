@@ -175,7 +175,7 @@ def iter_drc_records(blob: bytes):
 
 
 def _clamp_speed(value: float) -> float:
-    return max(0.05, min(20.0, float(value)))
+    return max(0.05, min(1000.0, float(value)))
 
 
 def _load_speed_from_config(

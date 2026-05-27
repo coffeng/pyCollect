@@ -418,7 +418,10 @@ def load_signal_config(config_path=None):
         "initial_trend_window": max(10.0, initial_trend_window),
         "initial_wave_window": max(10.0, initial_wave_window),
         "initial_baudrate": initial_baudrate,
-        "initial_sim_speed": max(0.05, min(20.0, initial_sim_speed)),
+        "initial_sim_speed": max(
+            0.05,
+            min(1000.0, initial_sim_speed),
+        ),
         "initial_split_ratio": max(0.1, min(0.9, initial_split_ratio)),
         "colors": colors,
         "user_role": user_role,
@@ -531,6 +534,7 @@ class CollectorWorker(QtCore.QThread):
         trend_defs,
         wave_defs,
         baudrate=19200,
+        trend_interval_sec=None,
         output_name="",
         simulation_mode=False,
         no_rtscts=False,
@@ -552,6 +556,7 @@ class CollectorWorker(QtCore.QThread):
             if int(baudrate) in (19200, 115200)
             else 19200
         )
+        self.trend_interval_sec = trend_interval_sec
         self.output_name = output_name
         self.simulation_mode = bool(simulation_mode)
         self.no_rtscts = bool(no_rtscts)
@@ -984,6 +989,7 @@ class CollectorWorker(QtCore.QThread):
                 "positive_trend_rows": [],
                 "positive_wave_rows": [],
                 "record_time_unix": None,
+                "record_main_type": None,
             }
 
         header_fmt = "< h b b H I b b H h " + "h b" * pycollect.DRI_MAX_SUBRECS
@@ -999,6 +1005,7 @@ class CollectorWorker(QtCore.QThread):
                 "positive_trend_rows": [],
                 "positive_wave_rows": [],
                 "record_time_unix": None,
+                "record_main_type": None,
             }
 
         r_len = header[0]
@@ -1012,6 +1019,7 @@ class CollectorWorker(QtCore.QThread):
                 "positive_trend_rows": [],
                 "positive_wave_rows": [],
                 "record_time_unix": None,
+                "record_main_type": None,
             }
 
         sr_desc = header[9:]
@@ -1069,6 +1077,7 @@ class CollectorWorker(QtCore.QThread):
                 "present_wave_rows": [],
                 "alarms": alarms,
                 "record_time_unix": int(r_time),
+                "record_main_type": int(r_maintype),
             }
         if r_maintype == 1:
             waves, waves_invalid, positive_wave_rows, present_wave_rows = self._extract_waves(parsed)
@@ -1084,6 +1093,7 @@ class CollectorWorker(QtCore.QThread):
                 "present_wave_rows": list(present_wave_rows),
                 "alarms": alarms,
                 "record_time_unix": int(r_time),
+                "record_main_type": int(r_maintype),
             }
         return {
             "trends": {},
@@ -1097,12 +1107,19 @@ class CollectorWorker(QtCore.QThread):
             "present_wave_rows": [],
             "alarms": alarms,
             "record_time_unix": int(r_time),
+            "record_main_type": int(r_maintype),
         }
 
     def run(self):
         ser = None
         output_file = ""
         output_fp = None
+        pc_start_dt = datetime.now()
+        monitor_first_unix = None
+        monitor_last_unix = None
+        trend_record_count = 0
+        waveform_record_count = 0
+        alarm_record_count = 0
         logical_time_sec = 0.0
         package_counter = 0
         try:
@@ -1169,6 +1186,21 @@ class CollectorWorker(QtCore.QThread):
                     output_fp.write(processed)
                     output_fp.flush()
                     payload = self._extract_from_record(processed)
+
+                    monitor_time = payload.get("record_time_unix")
+                    if monitor_time is not None:
+                        if monitor_first_unix is None:
+                            monitor_first_unix = int(monitor_time)
+                        monitor_last_unix = int(monitor_time)
+
+                    main_type = payload.get("record_main_type")
+                    if main_type == 0:
+                        trend_record_count += 1
+                    elif main_type == 1:
+                        waveform_record_count += 1
+                    elif main_type == DRI_MT_ALARM:
+                        alarm_record_count += 1
+
                     payload["index"] = package_counter
                     payload["length"] = len(processed)
                     payload["time"] = logical_time_sec
@@ -1203,6 +1235,31 @@ class CollectorWorker(QtCore.QThread):
         finally:
             if output_fp is not None and not output_fp.closed:
                 output_fp.close()
+            if output_file:
+                try:
+                    log_file = pycollect.write_drc_capture_log(
+                        output_file,
+                        pc_start_dt=pc_start_dt,
+                        pc_end_dt=datetime.now(),
+                        monitor_first_unix=monitor_first_unix,
+                        monitor_last_unix=monitor_last_unix,
+                        waveforms=[
+                            item.get("label") or item.get("id", "")
+                            for item in self.wave_defs
+                        ],
+                        trend_interval_sec=self.trend_interval_sec,
+                        trend_record_count=trend_record_count,
+                        waveform_record_count=waveform_record_count,
+                        alarm_record_count=alarm_record_count,
+                    )
+                    if log_file:
+                        self.status_signal.emit(
+                            f"Capture log saved: {Path(log_file).name}"
+                        )
+                except Exception as exc:
+                    self.status_signal.emit(
+                        f"WARNING: failed to write capture log: {exc}"
+                    )
             if output_file:
                 self.file_status_signal.emit("closed", output_file)
             if ser is not None and ser.is_open:
@@ -1929,6 +1986,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         records = []
         first_header_utc = None
         last_header_utc = None
+        first_record_time_unix = None
         last_alarm_text = "none"
         last_alarm_color = None
 
@@ -1952,6 +2010,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 header_dt = None
                 record_time_unix = payload.get("record_time_unix")
                 if record_time_unix is not None:
+                    if first_record_time_unix is None:
+                        first_record_time_unix = float(record_time_unix)
+                    rel_t = max(
+                        0.0,
+                        float(record_time_unix)
+                        - float(first_record_time_unix),
+                    )
                     try:
                         header_dt = datetime.fromtimestamp(
                             float(record_time_unix),
@@ -1986,6 +2051,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     sample_period = 1.0 / max(1.0, float(meta["sample_hz"]))
                     if wave_cursors[chan_id] is None:
                         wave_cursors[chan_id] = rel_t
+                    else:
+                        wave_cursors[chan_id] = max(
+                            float(wave_cursors[chan_id]),
+                            rel_t,
+                        )
                     invalid_flags = waves_invalid.get(chan_id, [])
                     for idx, sample in enumerate(samples):
                         t_val = wave_cursors[chan_id]
@@ -2038,18 +2108,41 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         }
 
     @staticmethod
-    def _build_review_series(points, start_sec, window_sec, gap_sec=1.0):
+    def _build_review_series(
+        points,
+        start_sec,
+        window_sec,
+        gap_sec=1.0,
+        hold_last=False,
+    ):
         end_sec = start_sec + window_sec
         x_vals = []
         y_vals = []
         invalid_vals = []
         prev_t = None
+        if hold_last:
+            prev_point = None
+            for point in points:
+                if point[0] <= start_sec:
+                    prev_point = point
+                    continue
+                break
+            if prev_point is not None:
+                x_vals.append(0.0)
+                y_vals.append(prev_point[1])
+                invalid_vals.append(bool(prev_point[2]))
+                prev_t = start_sec
+
         for t_val, y_val, invalid_flag in points:
             if t_val < start_sec:
                 continue
             if t_val > end_sec:
                 break
-            if prev_t is not None and (t_val - prev_t) > gap_sec:
+            if (
+                not hold_last
+                and prev_t is not None
+                and (t_val - prev_t) > gap_sec
+            ):
                 x_vals.append(float("nan"))
                 y_vals.append(float("nan"))
                 invalid_vals.append(False)
@@ -2590,7 +2683,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
 
         self.sim_speed_spin = QtWidgets.QDoubleSpinBox()
-        self.sim_speed_spin.setRange(0.05, 20.0)
+        self.sim_speed_spin.setRange(0.05, 1000.0)
         self.sim_speed_spin.setSingleStep(0.05)
         self.sim_speed_spin.setValue(self.config["initial_sim_speed"])
         self.advanced_section.content_layout.addWidget(
@@ -3057,6 +3150,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             trend_defs=self.trend_defs,
             wave_defs=self.wave_defs,
             baudrate=baudrate,
+            trend_interval_sec=float(self.trend_interval_spin.value()),
             output_name=self.output_name,
             simulation_mode=self.simulation_mode,
             no_rtscts=self.no_rtscts,
@@ -3530,6 +3624,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         return x_vals, y_vals, invalid_vals
 
     def update_plots(self, force=False):
+        trend_gap_sec = 1.0
+        try:
+            trend_interval_sec = float(self.trend_interval_spin.value())
+            trend_gap_sec = max(1.0, trend_interval_sec * 1.5)
+        except Exception:
+            pass
+
         if self.review_mode and self.review_records:
             trend_window, wave_window = self._effective_windows()
             start_sec = float(
@@ -3548,7 +3649,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     points,
                     start_sec,
                     trend_window,
-                    gap_sec=1.0,
+                    gap_sec=trend_gap_sec,
+                    hold_last=True,
                 )
                 y_valid = []
                 y_invalid = []
@@ -3675,7 +3777,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     points,
                     trend_window,
                     this_now,
-                    gap_sec=1.0,
+                    gap_sec=trend_gap_sec,
                 )
                 y_valid = []
                 y_invalid = []

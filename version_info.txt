@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1,0,3, 0),
-    prodvers=(1,0,3, 0),
+    filevers=(1,0,5, 0),
+    prodvers=(1,0,5, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x4,
@@ -15,11 +15,11 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'GE HealthCare'),
         StringStruct('FileDescription', 'pyCollect Bedside Monitor Data Collector'),
-        StringStruct('FileVersion', '1.0.3'),
-        StringStruct('ProductVersion', '1.0.3'),
+        StringStruct('FileVersion', '1.0.5'),
+        StringStruct('ProductVersion', '1.0.5'),
         StringStruct('ProductName', 'pyCollect'),
-        StringStruct('BuildDate', '2026-05-26'),
-        StringStruct('BuildTime', '22:44:57')]
+        StringStruct('BuildDate', '2026-05-27'),
+        StringStruct('BuildTime', '22:34:25')]
         )
       ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])

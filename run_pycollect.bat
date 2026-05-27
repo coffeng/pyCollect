@@ -4,7 +4,7 @@ setlocal
 set "ROOT=%~dp0"
 set "PY=%ROOT%.venv\Scripts\python.exe"
 set "EXE=%ROOT%dist\pyCollect.exe"
-set "DRC=C:\Users\100014430\Documents\GitLab\algorithms-tools\iCollect\Example.drc"
+set "DRC=C:\Users\100014430\Box\iCollect 5.x\Data\Parameter_Files\C.O\case001-083_primaari_1.drc"
 set "SIM_PORT=COM4"
 set "GUI_PORT=COM2"
 set "SIM_CTRL_PORT=9031"
