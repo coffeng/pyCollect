@@ -119,6 +119,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="In simulation mode, send all records without waveform filtering; let GUI select waveforms",
     )
+    parser.add_argument(
+        "--no-delay",
+        action="store_true",
+        help="Replay as fast as possible (skip all timing sleeps).",
+    )
     return parser.parse_args()
 
 
@@ -504,6 +509,7 @@ def replay_once(
     stop_event: threading.Event,
     metrics: dict,
     simulation_mode: bool = False,
+    no_delay: bool = False,
 ):
     sent = 0
     base_interval = _estimate_base_interval(records, fallback_interval)
@@ -521,7 +527,9 @@ def replay_once(
                 f"Speed updated from config: {speed_ctrl.current():.2f}x"
             )
 
-        if prev_time is None:
+        if no_delay:
+            wait_real = 0.0
+        elif prev_time is None:
             wait_real = 0.0
         else:
             delta_src = rec_time - prev_time
@@ -529,10 +537,11 @@ def replay_once(
                 delta_src = base_interval
             wait_real = delta_src / speed_ctrl.current()
 
-        next_send_time += wait_real
-        delay = next_send_time - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
+        if not no_delay:
+            next_send_time += wait_real
+            delay = next_send_time - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
 
         filtered = record if simulation_mode else apply_wave_request_filter(record, wave_state)
         if filtered is None:
@@ -631,6 +640,7 @@ def main():
                     stop_event,
                     metrics,
                     simulation_mode=args.simulation_mode,
+                    no_delay=args.no_delay,
                 )
                 if stop_event.is_set():
                     print("Stop requested by control port", flush=True)

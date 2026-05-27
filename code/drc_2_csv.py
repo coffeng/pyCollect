@@ -46,6 +46,109 @@ else:
     NO_CSV = True
 
 ECG12_TYPE_IDENTIFIER = 22  # Identifier for ECG12 packets
+DRI_MT_ALARM = 4
+DRI_AL_STATUS = 1
+
+
+def _decode_alarm_text_block(raw_bytes):
+    text_raw = raw_bytes.split(b"\x00", 1)[0]
+    text = text_raw.decode("latin-1", errors="ignore")
+    text = " ".join(text.split())
+    if len(text) < 3:
+        return ""
+    return text
+
+
+def _extract_alarm_entries_from_al_disp(payload_bytes, raw_offsets, sr_types):
+    """Extract al_disp boxes from DRI_MT_ALARM / DRI_AL_STATUS payload."""
+    entries = []
+
+    valid_indices = [
+        idx
+        for idx, st in enumerate(sr_types)
+        if int(st) > 0 and int(raw_offsets[idx]) >= 0
+    ]
+
+    for pos, idx in enumerate(valid_indices):
+        if int(sr_types[idx]) != DRI_AL_STATUS:
+            continue
+
+        start = int(raw_offsets[idx])
+        if pos < len(valid_indices) - 1:
+            end = int(raw_offsets[valid_indices[pos + 1]])
+        else:
+            end = len(payload_bytes)
+
+        if not (0 <= start < end <= len(payload_bytes)):
+            continue
+
+        sub = payload_bytes[start:end]
+        layout_candidates = [
+            (10, 100),
+            (10, 96),
+            (8, 96),
+            (12, 96),
+        ]
+
+        best_entries = []
+        best_nonempty_count = -1
+        for base, stride in layout_candidates:
+            decoded = []
+            for box_idx in range(5):
+                entry = base + (box_idx * stride)
+                if entry + 86 > len(sub):
+                    break
+
+                text = _decode_alarm_text_block(sub[entry:entry + 80])
+
+                text_changed = int.from_bytes(
+                    sub[entry + 80:entry + 82],
+                    byteorder="little",
+                    signed=False,
+                )
+                color = int.from_bytes(
+                    sub[entry + 82:entry + 84],
+                    byteorder="little",
+                    signed=False,
+                )
+                color_changed = int.from_bytes(
+                    sub[entry + 84:entry + 86],
+                    byteorder="little",
+                    signed=False,
+                )
+
+                if text_changed not in (0, 1):
+                    continue
+                if color_changed not in (0, 1):
+                    continue
+                if color < 0 or color > 3:
+                    continue
+
+                decoded.append({
+                    "box": box_idx + 1,
+                    "text": text,
+                    "color": int(color),
+                    "text_changed": int(text_changed),
+                })
+
+            nonempty_count = sum(1 for item in decoded if item.get("text"))
+            if nonempty_count > best_nonempty_count:
+                best_entries = decoded
+                best_nonempty_count = nonempty_count
+
+        if best_entries:
+            entries.extend(best_entries)
+
+    return entries
+
+
+def _alarm_color_name(color_code):
+    mapping = {
+        1: "white",
+        2: "yellow",
+        3: "red",
+    }
+    return mapping.get(int(color_code), "unknown")
 
 class VariableLogger:
     def __init__(self):
@@ -96,6 +199,8 @@ def extract_integers_post_header(
     gap_detected = 0
 
     pacer_info_list = []  # Temporary array to store pacer information
+    alarm_rows = []
+    alarm_prev_by_text = {}
     pacer_time = 0
     pacer_timestamp = None  # Initialize pacer_timestamp to avoid UnboundLocalError
 
@@ -252,6 +357,70 @@ def extract_integers_post_header(
                 wave_data.append(subrecs)
 
                 previous_r_nbr = r_nbr
+            elif r_maintype == DRI_MT_ALARM:
+                payload_bytes = all_data[data_pointer:data_pointer+record_len]
+                if len(payload_bytes) == record_len:
+                    raw_sr_offset = sr_desc[::2]
+                    raw_sr_type = [
+                        0 if t < -1 or t > 50 else t
+                        for t in sr_desc[1::2]
+                    ]
+                    alarm_entries = _extract_alarm_entries_from_al_disp(
+                        payload_bytes,
+                        raw_sr_offset,
+                        raw_sr_type,
+                    )
+                    current_by_text = {}
+                    for item in alarm_entries:
+                        text = str(item.get("text", "")).strip()
+                        if not text:
+                            continue
+
+                        box = int(item.get("box", 0))
+                        color = int(item.get("color", 0))
+
+                        existing = current_by_text.get(text)
+                        if existing is None or color > int(existing.get("color", 0)):
+                            current_by_text[text] = {
+                                "box": box,
+                                "color": color,
+                            }
+
+                    prev_texts = set(alarm_prev_by_text.keys())
+                    curr_texts = set(current_by_text.keys())
+
+                    for text in sorted(curr_texts):
+                        curr = current_by_text[text]
+                        box = int(curr.get("box", 0))
+                        color = int(curr.get("color", 0))
+                        event = "ON" if text not in prev_texts else "STATE"
+                        alarm_rows.append({
+                            "Time": readable_time,
+                            "UnixTime": float(r_time),
+                            "Box": box,
+                            "ColorCode": color,
+                            "Color": _alarm_color_name(color),
+                            "AlarmText": text,
+                            "Event": event,
+                            "ExpectedLifecycle": event,
+                        })
+
+                    for text in sorted(prev_texts - curr_texts):
+                        prev = alarm_prev_by_text[text]
+                        prev_color = int(prev.get("color", 0))
+                        prev_box = int(prev.get("box", 0))
+                        alarm_rows.append({
+                            "Time": readable_time,
+                            "UnixTime": float(r_time),
+                            "Box": prev_box,
+                            "ColorCode": prev_color,
+                            "Color": _alarm_color_name(prev_color),
+                            "AlarmText": text,
+                            "Event": "OFF",
+                            "ExpectedLifecycle": "OFF",
+                        })
+
+                    alarm_prev_by_text = current_by_text
         remaining_bytes = r_len - 40
         data_pointer += remaining_bytes  # Adjust pointer to skip over remaining bytes
     if progress_cb:
@@ -261,7 +430,7 @@ def extract_integers_post_header(
             pass
     if logger:
         logger.log_variables({"LastTime": readable_time, "PackageCount": cnt })
-    return trend_data, times, wave_data, first_wave_time_unix, pacer_info_list  # Return times, first_wave_time_unix, and pacer_info_list along with data
+    return trend_data, times, wave_data, first_wave_time_unix, pacer_info_list, alarm_rows
 
 def read_params_file(params_file_path):
     """
@@ -290,7 +459,7 @@ def process_drc_file(
     all_data = b''
     with open(data_file_path, 'rb') as file:
         all_data = file.read()
-    trend_records, times, wave_records, first_wave_time_unix, pacer_info_list = (
+    trend_records, times, wave_records, first_wave_time_unix, pacer_info_list, alarm_rows = (
         extract_integers_post_header(
             all_data,
             logger,
@@ -300,7 +469,20 @@ def process_drc_file(
     )
     trend_df = generate_dataframe(trend_records, times, params_df, logger)
     waves_df, freq = generate_waves_dataframe(wave_records, waves_df, first_wave_time_unix, logger)
-    return trend_df, waves_df, freq, pacer_info_list
+    alarms_df = pd.DataFrame(
+        alarm_rows,
+        columns=[
+            "Time",
+            "UnixTime",
+            "Box",
+            "ColorCode",
+            "Color",
+            "AlarmText",
+            "Event",
+            "ExpectedLifecycle",
+        ],
+    )
+    return trend_df, waves_df, freq, pacer_info_list, alarms_df
 
 def generate_waves_dataframe(all_records, params_df, first_wave_time_unix, logger=None):
     """
@@ -546,6 +728,43 @@ def save_pacers_to_csv(pacer_info_list, data_file_path):
     print (f"Pacerinfo saved to: {pacer_file_path}")  
 # GenAI generated code end
 
+
+def save_alarms_to_csv(alarms_df, data_file_path):
+    """Save alarm rows to alarms_*.csv."""
+    if NO_CSV:
+        return
+
+    file_name = os.path.basename(data_file_path)
+    root_name, _ext = os.path.splitext(file_name)
+    out_name = root_name + "_alarms.csv"
+
+    out_path = os.path.join(os.path.dirname(data_file_path), out_name)
+    with open(out_path, mode='w', newline='') as out_file:
+        writer = csv.writer(out_file)
+        writer.writerow([
+            "Time",
+            "UnixTime",
+            "Box",
+            "ColorCode",
+            "Color",
+            "AlarmText",
+            "Event",
+            "ExpectedLifecycle",
+        ])
+        if alarms_df is not None and len(alarms_df) > 0:
+            for _idx, row in alarms_df.iterrows():
+                writer.writerow([
+                    row.get("Time", ""),
+                    row.get("UnixTime", ""),
+                    row.get("Box", ""),
+                    row.get("ColorCode", ""),
+                    row.get("Color", ""),
+                    row.get("AlarmText", ""),
+                    row.get("Event", ""),
+                    row.get("ExpectedLifecycle", ""),
+                ])
+    print(f"Alarm CSV saved to: {out_path}")
+
 def process_folder(folder_path, params_file_path, waves_file_path, logger=None):
     """
     Processes all .drc files in the specified folder.
@@ -565,11 +784,16 @@ def process_folder(folder_path, params_file_path, waves_file_path, logger=None):
                     if logger:
                         logger.set_filename(data_file_path)  # Set the filename
     
-                    trend_dataframe, wave_dataframe, freq, pacer_info_list = process_drc_file(data_file_path, params_df, waves_df, logger)
+                    trend_dataframe, wave_dataframe, freq, pacer_info_list, alarms_df = process_drc_file(data_file_path, params_df, waves_df, logger)
                     output_file_path = data_file_path.replace('.drc', '_trends.csv')
                     if logger:
                         logger.log_variables({"TrendRows":  len(trend_dataframe)})
                     save_dataframe_to_csv(trend_dataframe, output_file_path, logger)
+
+                    if alarms_df is not None:
+                        if logger:
+                            logger.log_variables({"AlarmRows": len(alarms_df)})
+                        save_alarms_to_csv(alarms_df, data_file_path)
                     
                     if freq > 0:
                         waves_output_file_path = data_file_path.replace('.drc', '_waves.csv')

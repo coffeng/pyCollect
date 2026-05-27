@@ -46,6 +46,8 @@ START_WAVES_HEX = (
 ALARM_CMD_XMIT_STATUS = 0
 ALARM_CMD_ENTER_DIFFMODE = 2
 ALARM_CMD_EXIT_DIFFMODE = 3
+DRI_MT_ALARM = 4
+DRI_AL_STATUS = 1
 STOP_WAVES_HEX = (
     "7E58 0000 00E8 FD35 2808 6700 0000 0001 0000 0000 "
     "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
@@ -720,9 +722,125 @@ class CollectorWorker(QtCore.QThread):
                 break
         return found
 
+    @staticmethod
+    def _decode_alarm_text_block(raw_bytes):
+        # text[80] in al_disp_al; strip C-style terminator and whitespace
+        text_raw = raw_bytes.split(b"\x00", 1)[0]
+        text = text_raw.decode("latin-1", errors="ignore")
+        text = " ".join(text.split())
+        if len(text) < 3:
+            return ""
+        if re.search(r"[A-Za-z]", text) is None:
+            return ""
+        return text
+
+    def _extract_alarm_strings_from_al_disp(
+        self,
+        payload_bytes,
+        raw_offsets,
+        sr_types,
+    ):
+        """Decode alarm text[] entries from dri_al_msg/al_disp records.
+
+        Spec (8005313, section 4.2.1):
+        - Main type: DRI_MT_ALARM
+        - Subrecord type: DRI_AL_STATUS
+        - struct dri_al_msg contains al_disp[5]
+        - each al_disp_al has text[80]
+        """
+        entries = []
+        seen = set()
+
+        valid_indices = [
+            idx
+            for idx, st in enumerate(sr_types)
+            if int(st) > 0 and int(raw_offsets[idx]) >= 0
+        ]
+
+        for pos, idx in enumerate(valid_indices):
+            sr_type = int(sr_types[idx])
+            if sr_type != DRI_AL_STATUS:
+                continue
+
+            start = int(raw_offsets[idx])
+            if pos < len(valid_indices) - 1:
+                end = int(raw_offsets[valid_indices[pos + 1]])
+            else:
+                end = len(payload_bytes)
+
+            if not (0 <= start < end <= len(payload_bytes)):
+                continue
+
+            sub = payload_bytes[start:end]
+
+            # Known packed layouts observed in legacy and newer records.
+            # text[80], text_changed, color, color_changed, reserved...
+            layout_candidates = [
+                (10, 100),
+                (10, 96),
+                (8, 96),
+                (12, 96),
+            ]
+
+            best_entries = []
+            for base, stride in layout_candidates:
+                decoded = []
+                for block_idx in range(5):
+                    entry = base + (block_idx * stride)
+                    if entry + 86 > len(sub):
+                        break
+
+                    text = self._decode_alarm_text_block(sub[entry:entry + 80])
+                    if not text:
+                        continue
+
+                    # Booleans and color enum in packed structs
+                    text_changed = int.from_bytes(
+                        sub[entry + 80:entry + 82],
+                        byteorder="little",
+                        signed=False,
+                    )
+                    color = int.from_bytes(
+                        sub[entry + 82:entry + 84],
+                        byteorder="little",
+                        signed=False,
+                    )
+                    color_changed = int.from_bytes(
+                        sub[entry + 84:entry + 86],
+                        byteorder="little",
+                        signed=False,
+                    )
+
+                    if text_changed not in (0, 1):
+                        continue
+                    if color_changed not in (0, 1):
+                        continue
+                    if color < 0 or color > 3:
+                        continue
+
+                    decoded.append({
+                        "text": text,
+                        "color": color,
+                    })
+
+                if len(decoded) > len(best_entries):
+                    best_entries = decoded
+
+            for item in best_entries:
+                text = item.get("text", "")
+                key = text.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append(item)
+
+        return entries[:5]
+
     def _extract_trends(self, payload):
         out = {}
+        out_invalid = set()
         all_values = {}
+        all_invalid_rows = set()
         subgroup_values = {}
         positive_rows = set()
 
@@ -761,7 +879,9 @@ class CollectorWorker(QtCore.QThread):
             if idx < 0 or idx >= len(values):
                 continue
             raw_value = values[idx]
-            if raw_value == pycollect.DATA_INVALID:
+            if raw_value <= pycollect.DATA_INVALID:
+                all_values[item["row_identifier"]] = 0.0
+                all_invalid_rows.add(item["row_identifier"])
                 continue
             scaled = float(raw_value) / item["divider"]
             all_values[item["row_identifier"]] = scaled
@@ -776,15 +896,18 @@ class CollectorWorker(QtCore.QThread):
                 continue
 
             raw_value = values[item["value_index"]]
-            if raw_value == pycollect.DATA_INVALID:
+            if raw_value <= pycollect.DATA_INVALID:
+                out[item["id"]] = 0.0
+                out_invalid.add(item["id"])
                 continue
 
             out[item["id"]] = float(raw_value) / item["divider"]
 
-        return out, positive_rows, all_values
+        return out, out_invalid, positive_rows, all_values, all_invalid_rows
 
     def _extract_waves(self, payload):
         out = {}
+        out_invalid = {}
         positive_rows = set()
         present_rows = set()
         valid_indices = [
@@ -821,10 +944,15 @@ class CollectorWorker(QtCore.QThread):
             divider = 1.0
             if wave_meta is not None:
                 divider = wave_meta["divider"]
-            scaled_samples = [
-                float(sample) / divider
-                for sample in raw_samples
-            ]
+            scaled_samples = []
+            invalid_flags = []
+            for sample in raw_samples:
+                if int(sample) <= pycollect.DATA_INVALID:
+                    scaled_samples.append(0.0)
+                    invalid_flags.append(True)
+                else:
+                    scaled_samples.append(float(sample) / divider)
+                    invalid_flags.append(False)
 
             # Track waveform availability from incoming stream regardless of
             # current GUI selection, so selector/header reflect actual data.
@@ -843,8 +971,9 @@ class CollectorWorker(QtCore.QThread):
 
             if chan_id and chan_id not in out:
                 out[chan_id] = scaled_samples
+                out_invalid[chan_id] = invalid_flags
 
-        return out, positive_rows, present_rows
+        return out, out_invalid, positive_rows, present_rows
 
     def _extract_from_record(self, record_data):
         if len(record_data) < 40:
@@ -900,15 +1029,41 @@ class CollectorWorker(QtCore.QThread):
             "sr_types": sr_types,
         }
 
+        alarms = []
+        if r_maintype == DRI_MT_ALARM:
+            alarms_from_spec = self._extract_alarm_strings_from_al_disp(
+                payload,
+                raw_offsets,
+                sr_types,
+            )
+            if alarms_from_spec:
+                alarms = alarms_from_spec
+            else:
+                alarms = [
+                    {
+                        "text": text,
+                        "color": None,
+                    }
+                    for text in self._extract_alarm_strings(payload)
+                ]
+
         if r_maintype == 0:
-            trends, positive_trend_rows, all_trend_rows = (
+            (
+                trends,
+                trends_invalid,
+                positive_trend_rows,
+                all_trend_rows,
+                invalid_trend_rows,
+            ) = (
                 self._extract_trends(parsed)
             )
-            alarms = self._extract_alarm_strings(payload)
             return {
                 "trends": trends,
+                "trends_invalid": list(trends_invalid),
                 "trend_rows": all_trend_rows,
+                "invalid_trend_rows": list(invalid_trend_rows),
                 "waves": {},
+                "waves_invalid": {},
                 "positive_trend_rows": list(positive_trend_rows),
                 "positive_wave_rows": [],
                 "present_wave_rows": [],
@@ -916,23 +1071,27 @@ class CollectorWorker(QtCore.QThread):
                 "record_time_unix": int(r_time),
             }
         if r_maintype == 1:
-            waves, positive_wave_rows, present_wave_rows = self._extract_waves(parsed)
-            alarms = self._extract_alarm_strings(payload)
+            waves, waves_invalid, positive_wave_rows, present_wave_rows = self._extract_waves(parsed)
             return {
                 "trends": {},
+                "trends_invalid": [],
                 "trend_rows": {},
+                "invalid_trend_rows": [],
                 "waves": waves,
+                "waves_invalid": waves_invalid,
                 "positive_trend_rows": [],
                 "positive_wave_rows": list(positive_wave_rows),
                 "present_wave_rows": list(present_wave_rows),
                 "alarms": alarms,
                 "record_time_unix": int(r_time),
             }
-        alarms = self._extract_alarm_strings(payload)
         return {
             "trends": {},
+            "trends_invalid": [],
             "trend_rows": {},
+            "invalid_trend_rows": [],
             "waves": {},
+            "waves_invalid": {},
             "positive_trend_rows": [],
             "positive_wave_rows": [],
             "present_wave_rows": [],
@@ -1205,6 +1364,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_last_seen_by_row = {}  # Track all waveforms for header
         self._last_logged_available_waves = None
         self.last_alarm_text = "none"
+        self.last_alarm_color = None
+        self.last_logged_alarm_text = "none"
+        self.last_logged_alarm_color = None
         self.last_alarm_seen_monotonic = None
         self.alarm_start_hex, self.alarm_stop_hex, self.alarm_start_hex_list, self.alarm_stop_hex_list = (
             self._resolve_alarm_commands()
@@ -1213,6 +1375,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.current_file_state = "default"
         self.csv_worker = None
         self.csv_convert_in_progress = False
+        self.invalid_detected_total = 0
+        self.invalid_wave_points_total = 0
+        self.invalid_trend_points_total = 0
+        self._last_invalid_log_monotonic = 0.0
+        self._last_no_invalid_log_monotonic = 0.0
 
         self.worker = None
         self.logical_now_sec = 0.0
@@ -1229,8 +1396,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.trend_plots = {}
         self.trend_curves = {}
+        self.trend_invalid_curves = {}
         self.wave_plots = {}
         self.wave_curves = {}
+        self.wave_invalid_curves = {}
         self.trend_catalog_buttons = {}
 
         self.sim_idle_timer = QtCore.QTimer(self)
@@ -1246,6 +1415,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_request_state_timer.timeout.connect(
             self._refresh_trend_button_states
         )
+
+        self.invalid_pen = pg.mkPen("#9aa0a6", width=2)
 
         self._apply_pcs_theme()
         self._build_ui()
@@ -1297,6 +1468,18 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if isinstance(value, str) and value.strip():
             return value.strip()
         return fallback
+
+    def _alarm_color_css(self, alarm_color):
+        # al_disp color enum values are 0..3.
+        color_map = {
+            0: "#d7dde8",
+            1: "#ffffff",
+            2: "#ffd166",
+            3: "#ff4757",
+        }
+        if isinstance(alarm_color, int):
+            return color_map.get(alarm_color, color_map[3])
+        return self._cfg_color("text", "alarm", "#ff4757")
 
     def _resolve_alarm_commands(self):
         """Return alarm start/stop request frames from config.
@@ -2219,7 +2402,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.recent_alarm_label.setWordWrap(True)
         self.recent_alarm_label.setStyleSheet(
             "font-weight: 600;"
-            f"color:{self._cfg_color('text', 'alarm', '#ff4757')};"
+            f"color:{self._cfg_color('text', 'secondary', '#9aa0a6')};"
         )
 
         top_row.addWidget(self.last_record_label, 0)
@@ -2263,11 +2446,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 self.trend_defs.append(selected)
                 if selected["id"] not in self.trend_buffers:
                     self.trend_buffers[selected["id"]] = deque()
+                self._sort_trend_defs_by_catalog()
                 self._sync_all_trend_buffers()
                 self._rebuild_trend_plots()
         elif not checked and row_id in selected_row_ids:
             self.trend_defs = [d for d in self.trend_defs
                                if int(d["row_identifier"]) != row_id]
+            self._sort_trend_defs_by_catalog()
             self._rebuild_trend_plots()
         self._apply_trend_button_style(row_id)
 
@@ -2348,12 +2533,15 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _rebuild_trend_plots(self):
         """Clear and recreate trend plots from self.trend_defs."""
+        self._sort_trend_defs_by_catalog()
+
         for item_id, plot in list(self.trend_plots.items()):
             self.trends_layout.removeWidget(plot)
             plot.setParent(None)
             plot.deleteLater()
         self.trend_plots.clear()
         self.trend_curves.clear()
+        self.trend_invalid_curves.clear()
 
         min_h = self._calc_graph_min_height()
         trend_fallbacks = ["#2b83f6", "#24b47e", "#b38ddb", "#6fd3ff"]
@@ -2372,12 +2560,28 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     width=2,
                 )
             )
+            invalid_curve = plot.plot(pen=self.invalid_pen)
             self.trend_plots[item["id"]] = plot
             self.trend_curves[item["id"]] = curve
+            self.trend_invalid_curves[item["id"]] = invalid_curve
             self.trends_layout.addWidget(plot)
 
         self.update_plots()
         self._refresh_trend_button_states()
+
+    def _sort_trend_defs_by_catalog(self):
+        """Keep selected trends in the same order as the trend catalog."""
+        rank_by_row = {
+            int(item["row_identifier"]): idx
+            for idx, item in enumerate(self.all_trend_defs)
+        }
+        self.trend_defs = sorted(
+            self.trend_defs,
+            key=lambda item: rank_by_row.get(
+                int(item.get("row_identifier", -1)),
+                10**9,
+            ),
+        )
 
     def _rebuild_wave_plots(self):
         """Clear and recreate wave plots from self.wave_defs."""
@@ -2387,6 +2591,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             plot.deleteLater()
         self.wave_plots.clear()
         self.wave_curves.clear()
+        self.wave_invalid_curves.clear()
 
         min_h = self._calc_graph_min_height()
         wave_fallbacks = ["#f23c3c", "#ff8c42", "#ff5a7a", "#f6d743"]
@@ -2405,8 +2610,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                     width=1.5,
                 )
             )
+            invalid_curve = plot.plot(pen=self.invalid_pen)
             self.wave_plots[item["id"]] = plot
             self.wave_curves[item["id"]] = curve
+            self.wave_invalid_curves[item["id"]] = invalid_curve
             self.waves_layout.addWidget(plot)
 
         self.update_plots()
@@ -2528,6 +2735,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.wave_user_unrequested_rows.clear()
         self.capture_started_monotonic = time.monotonic()
         self.last_alarm_text = "none"
+        self.last_alarm_color = None
         self.last_alarm_seen_monotonic = None
         self.trend_history_by_row.clear()
         for values in self.trend_buffers.values():
@@ -2673,6 +2881,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def on_package(self, payload):
         rel_t = float(payload.get("time", 0.0))
+        pkg_idx = int(payload.get("index", 0) or 0)
         record_time_unix = payload.get("record_time_unix")
         if record_time_unix is not None:
             try:
@@ -2688,10 +2897,56 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         trend_rows = payload.get("trend_rows", {})
         waves = payload.get("waves", {})
+        trends_invalid = set(payload.get("trends_invalid", []))
+        waves_invalid = payload.get("waves_invalid", {}) or {}
         positive_trend_rows = payload.get("positive_trend_rows", [])
         positive_wave_rows = payload.get("positive_wave_rows", [])
         present_wave_rows = payload.get("present_wave_rows", [])
-        alarm_texts = payload.get("alarms", []) or []
+        alarm_items = payload.get("alarms", []) or []
+        alarm_texts = []
+        alarm_color = None
+        for item in alarm_items[:5]:
+            if isinstance(item, dict):
+                text = str(item.get("text", "")).strip()
+                color = item.get("color")
+            else:
+                text = str(item).strip()
+                color = None
+            if not text:
+                continue
+            alarm_texts.append(text)
+            if alarm_color is None and isinstance(color, int):
+                alarm_color = color
+
+        trend_invalid_count = len(trends_invalid)
+        wave_invalid_count = 0
+        for flags in waves_invalid.values():
+            wave_invalid_count += sum(1 for flag in flags if bool(flag))
+
+        now_for_log = time.monotonic()
+        if trend_invalid_count > 0 or wave_invalid_count > 0:
+            self.invalid_detected_total += 1
+            self.invalid_trend_points_total += trend_invalid_count
+            self.invalid_wave_points_total += wave_invalid_count
+            if (now_for_log - self._last_invalid_log_monotonic) >= 1.0:
+                self._last_invalid_log_monotonic = now_for_log
+                self.log(
+                    "Invalid samples detected: "
+                    f"pkg={pkg_idx}, "
+                    f"trend_slots={trend_invalid_count}, "
+                    f"wave_points={wave_invalid_count}, "
+                    "render=grey@0"
+                )
+        else:
+            if (
+                self.invalid_detected_total == 0
+                and (now_for_log - self._last_no_invalid_log_monotonic) >= 30.0
+            ):
+                self._last_no_invalid_log_monotonic = now_for_log
+                self.log(
+                    "No invalid samples detected yet "
+                    f"(pkg={pkg_idx}); grey invalid overlay will not appear."
+                )
 
         prev_trend_count = len(self.positive_trend_rows)
         prev_wave_count = len(self.positive_wave_rows)
@@ -2738,7 +2993,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             if history is None:
                 history = deque()
                 self.trend_history_by_row[row_id] = history
-            history.append((rel_t, float(val)))
+            trend_slot_id = f"t_{row_id}"
+            is_invalid = trend_slot_id in trends_invalid
+            history.append((rel_t, float(val), is_invalid))
 
         cutoff = rel_t - trend_window
         for history in self.trend_history_by_row.values():
@@ -2754,23 +3011,39 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             samples = waves.get(chan_id)
             if not samples:
                 continue
+            sample_invalid_flags = waves_invalid.get(chan_id, [])
             self.wave_last_seen_monotonic[chan_id] = now_mono
 
             sample_period = 1.0 / max(1.0, float(item["sample_hz"]))
             if self.wave_cursors[chan_id] is None:
                 self.wave_cursors[chan_id] = rel_t
 
-            for sample in samples:
+            for idx, sample in enumerate(samples):
                 t_val = self.wave_cursors[chan_id]
                 self.wave_cursors[chan_id] += sample_period
-                self.wave_buffers[chan_id].append((t_val, sample))
+                invalid_flag = False
+                if idx < len(sample_invalid_flags):
+                    invalid_flag = bool(sample_invalid_flags[idx])
+                self.wave_buffers[chan_id].append((t_val, sample, invalid_flag))
                 max_wave_t = max(max_wave_t, t_val)
 
         self.logical_now_sec = max(self.logical_now_sec, rel_t, max_wave_t)
 
         if alarm_texts:
-            self.last_alarm_text = " | ".join(alarm_texts[:3])
+            self.last_alarm_text = " | ".join(alarm_texts[:5])
+            self.last_alarm_color = alarm_color
             self.last_alarm_seen_monotonic = time.monotonic()
+            if (
+                self.last_alarm_text != self.last_logged_alarm_text
+                or self.last_alarm_color != self.last_logged_alarm_color
+            ):
+                self.log(
+                    "Alarm banner text: "
+                    f"{self.last_alarm_text} "
+                    f"(al_disp_color={self.last_alarm_color})"
+                )
+                self.last_logged_alarm_text = self.last_alarm_text
+                self.last_logged_alarm_color = self.last_alarm_color
 
         self._update_graph_header()
         self.update_plots()
@@ -2851,24 +3124,34 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.recent_waves_label.setText(f"Waveforms (last 5s): {text}")
 
         alarm_text = "none"
+        alarm_css = self._cfg_color("text", "secondary", "#9aa0a6")
         if self.last_alarm_seen_monotonic is not None:
             alarm_age = time.monotonic() - float(self.last_alarm_seen_monotonic)
             if alarm_age <= 30.0 and self.last_alarm_text:
                 alarm_text = self.last_alarm_text
+                alarm_css = self._alarm_color_css(self.last_alarm_color)
         self.recent_alarm_label.setText(f"Alarm: {alarm_text}")
+        self.recent_alarm_label.setStyleSheet(
+            "font-weight: 600;"
+            f"color:{alarm_css};"
+        )
 
     @staticmethod
     def _build_wrapped_series(points, window_sec, now_sec, gap_sec=1.0):
         if not points:
-            return [], []
+            return [], [], []
 
         safe_window = max(0.1, float(window_sec))
         safe_gap = min(max(0.0, float(gap_sec)), max(0.0, safe_window - 0.1))
 
         x_vals = []
         y_vals = []
+        invalid_vals = []
         prev_x = None
-        for t_val, y_val in points:
+        for point in points:
+            t_val = point[0]
+            y_val = point[1]
+            invalid_flag = bool(point[2]) if len(point) >= 3 else False
             age = now_sec - t_val
             if age < 0.0:
                 continue
@@ -2879,10 +3162,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             if prev_x is not None and x_mod < prev_x:
                 x_vals.append(float("nan"))
                 y_vals.append(float("nan"))
+                invalid_vals.append(False)
             x_vals.append(x_mod)
             y_vals.append(y_val)
+            invalid_vals.append(invalid_flag)
             prev_x = x_mod
-        return x_vals, y_vals
+        return x_vals, y_vals, invalid_vals
 
     def update_plots(self, force=False):
         trend_window, wave_window = self._effective_windows()
@@ -2898,6 +3183,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 if item["id"] not in self.trend_curves:
                     continue
                 self.trend_curves[item["id"]].setData([], [])
+                self.trend_invalid_curves[item["id"]].setData([], [])
+                self.trend_plots[item["id"]].setTitle(item["title"])
                 self.trend_plots[item["id"]].setXRange(
                     0,
                     trend_window,
@@ -2907,6 +3194,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 if item["id"] not in self.wave_curves:
                     continue
                 self.wave_curves[item["id"]].setData([], [])
+                self.wave_invalid_curves[item["id"]].setData([], [])
+                self.wave_plots[item["id"]].setTitle(item["title"])
                 self.wave_plots[item["id"]].setXRange(
                     0,
                     wave_window,
@@ -2920,18 +3209,39 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             points = self.trend_buffers.get(item["id"])
             if points:
                 this_now = series_now(points)
-                x_data, y_data = self._build_wrapped_series(
+                x_data, y_data, invalid_data = self._build_wrapped_series(
                     points,
                     trend_window,
                     this_now,
                     gap_sec=1.0,
                 )
-                self.trend_curves[item["id"]].setData(x_data, y_data)
+                y_valid = []
+                y_invalid = []
+                for value, inv in zip(y_data, invalid_data):
+                    if isinstance(value, float) and math.isnan(value):
+                        y_valid.append(value)
+                        y_invalid.append(value)
+                        continue
+                    if inv:
+                        y_valid.append(float("nan"))
+                        y_invalid.append(0.0)
+                    else:
+                        y_valid.append(value)
+                        y_invalid.append(float("nan"))
+                self.trend_curves[item["id"]].setData(x_data, y_valid)
+                self.trend_invalid_curves[item["id"]].setData(x_data, y_invalid)
+
                 latest = points[-1][1]
-                fmt = f"{latest:.0f}" if latest == round(latest) else f"{latest:.1f}"
-                self.trend_plots[item["id"]].setTitle(
-                    f"{item['title']} : {fmt}"
-                )
+                latest_invalid = bool(points[-1][2]) if len(points[-1]) >= 3 else False
+                if latest_invalid:
+                    self.trend_plots[item["id"]].setTitle(
+                        f"{item['title']} : DATA_INVALID"
+                    )
+                else:
+                    fmt = f"{latest:.0f}" if latest == round(latest) else f"{latest:.1f}"
+                    self.trend_plots[item["id"]].setTitle(
+                        f"{item['title']} : {fmt}"
+                    )
             self.trend_plots[item["id"]].setXRange(
                 0,
                 trend_window,
@@ -2944,13 +3254,35 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             points = self.wave_buffers.get(item["id"])
             if points:
                 this_now = series_now(points)
-                x_data, y_data = self._build_wrapped_series(
+                x_data, y_data, invalid_data = self._build_wrapped_series(
                     points,
                     wave_window,
                     this_now,
                     gap_sec=1.0,
                 )
-                self.wave_curves[item["id"]].setData(x_data, y_data)
+                y_valid = []
+                y_invalid = []
+                for value, inv in zip(y_data, invalid_data):
+                    if isinstance(value, float) and math.isnan(value):
+                        y_valid.append(value)
+                        y_invalid.append(value)
+                        continue
+                    if inv:
+                        y_valid.append(float("nan"))
+                        y_invalid.append(0.0)
+                    else:
+                        y_valid.append(value)
+                        y_invalid.append(float("nan"))
+                self.wave_curves[item["id"]].setData(x_data, y_valid)
+                self.wave_invalid_curves[item["id"]].setData(x_data, y_invalid)
+
+                latest_invalid = bool(points[-1][2]) if len(points[-1]) >= 3 else False
+                if latest_invalid:
+                    self.wave_plots[item["id"]].setTitle(
+                        f"{item['title']} : DATA_INVALID"
+                    )
+                else:
+                    self.wave_plots[item["id"]].setTitle(item["title"])
             self.wave_plots[item["id"]].setXRange(0, wave_window, padding=0.0)
 
     def on_finished(self, output_file):
