@@ -23,6 +23,43 @@ This document does **not** cover command-line (CLI) operation.
 
 ---
 
+## 1a. Intended Use
+
+pyCollect data collection software is intended to be used as a research tool for collecting data from specified GE HealthCare products. This product does not affect the intended use of these other products.
+
+> **WARNING**
+>
+> This data collection software is not intended for clinical use and is not a medical device.
+
+### Compatible GE HealthCare Devices
+
+pyCollect is compatible with GE HealthCare patient monitors that implement the S/5 DRI (Datex Record Interface) protocol, including:
+
+- Anesthesia Monitor AS/3, S/5
+- Critical Care Monitor CS/3, S/5
+- Compact Anesthesia Monitor AS/3, S/5
+- Compact Critical Care Monitor CS/3, S/5
+- Light Monitor
+- Cardiocap/5 Monitor
+- FM Monitor
+- B40, B40i, B20 and B20i Monitors
+- CARESCAPE Monitor B450, B650, B850
+- CARESCAPE B450, B650, B850 monitors
+- CARESCAPE Canvas 1000, CARESCAPE Canvas Smart Display monitors
+- Patient Monitor B105M, B125M, B155M
+
+Refer to the manual of the GE HealthCare device for instructions on how to safely connect your PC to the patient monitor.
+
+### Safety Precautions
+
+Refer to the GE HealthCare monitor manuals for safety precautions.
+
+### Responsibility
+
+GE HealthCare shall in no event be liable for any direct, indirect, incidental, special, or consequential damages caused by this product.
+
+---
+
 ## 2. System Requirements
 
 - Windows 10 or Windows 11
@@ -69,8 +106,13 @@ Launch methods:
 1. Desktop shortcut: `pyCollect`
 2. Start menu: `pyCollect`
 3. Executable: `pyCollect.exe`
+4. Command line with auto-start: `pyCollect.exe --qt-gui COM5 --baud 19200 --output case123.drc`
 
 On launch, the main window title is **pyCollect Interactive Viewer**.
+
+When a COM port is provided on the command line, capture starts automatically with no additional user interaction required. All other settings (waveforms, trends, duration, folder) are loaded from the persisted JSON config.
+
+Without command-line arguments, the GUI opens and the operator selects port, baud rate, and filename manually before clicking `START`.
 
 ---
 
@@ -82,13 +124,13 @@ The GUI is organized into a left workflow sidebar and right graph area.
 
 The CAPTURE tab contains all controls for configuring and running a live recording session.
 
-![Capture Tab - Live Recording](C:/Users/100014430/Documents/GitHub/Enterprise/pyCollect/assets/screenshot_capture_tab.png)
+![Capture Tab - Live Recording](assets/screenshot_capture_tab.png)
 
 ### 5.2 Review Tab
 
 The REVIEW tab provides file review, CSV conversion, and capture log summary.
 
-![Review Tab - DRC File Review](C:/Users/100014430/Documents/GitHub/Enterprise/pyCollect/assets/screenshot_review_tab.png)
+![Review Tab - DRC File Review](assets/screenshot_review_tab.png)
 
 ### 5.3 Sidebar Sections
 
@@ -98,7 +140,7 @@ The sidebar uses a tabbed interface with **CAPTURE** and **REVIEW** tabs:
 - `START` / `STOP` button
 - `Apply Capture Selection to Live View`
 - Source Port (with automatic S/5 port scan)
-- Baud rate (successful source+baud combinations are highlighted after scan)
+- Baud rate (successful source+baud combinations are highlighted green after scan)
 - Refresh Ports / Scanning indicator with scan result tooltip
 - Trend Interval
 - Recording Folder + Browse
@@ -118,8 +160,11 @@ The sidebar uses a tabbed interface with **CAPTURE** and **REVIEW** tabs:
   - Waveform Window (sec)
 - `Waveform Selection` (collapsible)
 - `Trends Selection` (collapsible)
+- `Case Notes` (collapsible)
 - `Recorder Output` (status log)
 - `Advanced` (lock, simulator speed)
+
+![Sidebar - Case Notes and Channel Selection](assets/screenshot_sidebar_notes.png)
 
 ### 5.4 Graph/Status Area
 
@@ -130,6 +175,12 @@ The sidebar uses a tabbed interface with **CAPTURE** and **REVIEW** tabs:
   - Recently active waveforms
   - Recent alarm text
 - Review slider (visible in review mode)
+
+### 5.5 Kiosk Mode (Full Screen)
+
+Maximizing or full-screening the window (via the title bar maximize button or dragging to the top edge) automatically hides the sidebar, giving the full window area to the live graphs and alarm banner. Restoring the window to normal size brings the sidebar back.
+
+This provides a simplified operator view during collection: the graphs, alarm status, and header information remain visible without configuration controls.
 
 ---
 
@@ -286,8 +337,24 @@ Primary runtime config location:
 
 ### 12.1 Recording Output
 
-- DRC file: as configured in `File Save Status`
-- Capture log file: saved when capture closes (written alongside DRC output path)
+- DRC file: as configured in the CAPTURE tab
+- Capture log file (`.log`): saved automatically when capture closes, written alongside the DRC file
+
+The capture log records:
+
+- PC start and end time (local clock)
+- Monitor first and last record timestamps (from DRC record headers)
+- PC–Monitor clock offset
+- Total record counts by type (trend, waveform, alarm)
+- Recording duration
+
+This information supports post-hoc time synchronization between the collection PC and the patient monitor, and is useful when correlating data across devices or sites.
+
+### 12.2 Multi-Instance Operation
+
+pyCollect supports running multiple instances simultaneously on the same PC, each connected to a different COM port. Each instance uses a unique localhost control port (starting at 9032) and discovers peer instances automatically. Start and stop commands are forwarded between instances so all collectors can be coordinated from any window.
+
+This capability supports scenarios such as collecting from a reference device and an investigational device in parallel.
 
 ### 12.2 GUI Status Log
 
@@ -306,6 +373,10 @@ Primary runtime config location:
 - Click `Refresh Ports`.
 - Verify cable/adapter and driver installation.
 - Verify port is not already opened by another app.
+
+The port scanner automatically probes all detected COM ports at both 19200 and 115200 baud, sending a DRI protocol request and checking for a valid response. Ports that respond are highlighted green in the dropdown; ports that do not respond are marked red. The tooltip on the Refresh Ports button shows a summary of the most recent scan results.
+
+This significantly reduces the time spent diagnosing COM port configuration issues, which are among the most frequent problems encountered in clinical studies.
 
 ### 13.2 Cannot Start Capture
 
@@ -349,5 +420,7 @@ Review is enabled only when:
 ---
 
 ## 15. Clinical Use Disclaimer
+
+This data collection software is intended to be used as a research tool for collecting data from specified GE HealthCare products. It is **not intended for clinical use** and is **not a medical device**.
 
 For research/engineering workflow support only unless explicitly validated and approved by your organization for clinical use.

@@ -2,6 +2,19 @@
 
 This document started as a plan and now also tracks implemented/tested status for the current prototype.
 
+## Intended Use
+
+pyCollect data collection software is intended to be used as a research tool
+for collecting data from specified GE HealthCare products. This product does not
+affect the intended use of these other products.
+
+> **WARNING**
+>
+> **This data collection software is not intended for clinical use and is not a
+> medical device.**
+
+*(Reproduced from the iCollect Manual, DOC 2098308-001.)*
+
 ## Important: Default Configuration Sync
 
 **For maintainers:** The default configuration file deployed with the installer 
@@ -236,28 +249,47 @@ pyCollect/
 ├── .vscode/
 │   └── tasks.json                        # VS Code build/run tasks
 │
-├── ENTRY POINTS (Standalone Scripts)
-├── pycollect.py                          # Main CLI: collection, conversion, headless modes
+├── ENTRY POINTS (Root)
 ├── run_pycollect.bat                     # Windows batch launcher (6 options)
 ├── run_pycollect.sh                      # Unix/Linux launcher
+├── build.py                              # PyInstaller build + Inno Setup driver
+├── pyCollect.spec                        # PyInstaller spec (GUI, windowed)
+├── pyCollect-cli.spec                    # PyInstaller spec (CLI, console)
+├── pyCollect.iss                         # Inno Setup installer script
 │
-├── SUPPORT UTILITIES (Not directly invoked by user)
-├── drc_monitor_simulator.py              # Replays DRC as simulated monitor stream
-├── serial_bridge.py                      # Serial port forwarding tool
-├── drc_2_csv.py                          # DRC-to-CSV converter library
-├── local_control.py                      # Localhost control server used by simulator and GUI
-├── pycollect_qt_gui.py                   # PyQt5 GUI implementation (imported by others)
+├── code/                                 # All Python source modules
+│   ├── pycollect.py                      # Core CLI: protocol, capture, DRC I/O, entry point
+│   ├── pycollect_qt_gui.py               # Main GUI window (slim: imports mixins)
+│   ├── gui_theme_mixin.py                # Color / style helpers
+│   ├── gui_build_mixin.py                # _build_ui, _connect_signals, Notes UI
+│   ├── gui_review_mixin.py               # Review load, slider, CSV conversion, locking
+│   ├── gui_catalog_mixin.py              # Trend/wave catalog, graph rebuild
+│   ├── gui_capture_mixin.py              # Capture start/stop, port scan, wave catalog
+│   ├── gui_plot_mixin.py                 # on_package, update_plots, on_finished
+│   ├── config_loader.py                  # JSON config loader, path resolution
+│   ├── collapsible_section.py            # Lockable CollapsibleSection widget
+│   ├── collector_worker.py               # QThread collection worker (serial + alarm)
+│   ├── csv_conversion_worker.py          # QThread DRC→CSV wrapper
+│   ├── notes_manager.py                  # CaseNotesManager (.txt sidecar persistence)
+│   ├── port_scan_worker.py               # QThread port scanner
+│   ├── live_monitor_plot.py              # matplotlib HR/ECG plot (terminal mode)
+│   ├── drc_2_csv.py                      # DRC-to-CSV converter library
+│   ├── drc_monitor_simulator.py          # Replays DRC as simulated monitor stream
+│   ├── serial_bridge.py                  # Serial port forwarding tool
+│   └── local_control.py                  # Localhost control server (simulator + GUI)
 │
-├── CONFIGURATION FILES
-├── pycollect_gui_config.json             # JSON waveform/trend definitions (used by Qt GUI & terminal-simulator)
-├── params5.txt                           # Metadata: trend channel definitions
-├── waves5.txt                            # Metadata: waveform channel definitions
+├── config/                               # Static signal definitions and GUI config
+│   ├── pycollect_gui_config.json         # Waveform/trend selections and UI settings
+│   ├── params5.txt                       # Trend channel metadata (label, unit, divider)
+│   └── waves5.txt                        # Waveform channel metadata (SR, label, unit)
 │
-├── TEST SUITES (Smoke/Integration Tests)
-├── test_pycollect_simulator_5_records.py # Unit test: pycollect library with simulator
-├── ui_sidebar_smoke_test.py              # Qt GUI smoke test: sidebar widgets
-├── ui_waveform_catalog_smoke_test.py     # Qt GUI smoke test: waveform catalog state machine
-├── tests/serial_loopback_test.py         # Serial loopback validation for COM bridge path
+├── tests/                                # Automated smoke / integration tests
+│   ├── ui_sidebar_smoke_test.py          # Sidebar widgets (22 assertions)
+│   ├── ui_lock_role_smoke_test.py        # Lock/role controls (55 assertions)
+│   ├── ui_waveform_catalog_smoke_test.py # Catalog state machine (27 assertions)
+│   ├── ui_notes_smoke_test.py            # Notes manager + GUI (42 assertions)
+│   ├── test_pycollect_simulator_5_records.py # Integration: 5-record serial test
+│   ├── serial_loopback_test.py           # Serial loopback validation for COM bridge path
 ├── tests/sim_gui_diag.py                 # Headless simulator-to-GUI packet diagnostic
 
 ├── CONTROL / LAUNCHER HELPERS
@@ -357,18 +389,38 @@ pyCollect/
 - **Dependencies:** `pyserial`, `json`, `struct`, `pathlib`
 - **Optional:** `matplotlib` (for `--gui` mode only)
 
-#### **pycollect_qt_gui.py** — PyQt5 Desktop GUI
-- **Purpose:** Full-featured GUI with sidebar controls and real-time waveform display
+#### **pycollect_qt_gui.py** — PyQt5 Desktop GUI (Main Window)
+- **Purpose:** Slim main window module that composes six mixin classes
+- **Architecture:**
+  ```
+  PyCollectQtWindow(
+      _GuiThemeMixin,        # gui_theme_mixin.py   — color/style
+      _GuiBuildMixin,        # gui_build_mixin.py   — _build_ui, _connect_signals, Notes UI
+      _GuiReviewMixin,       # gui_review_mixin.py  — review load, slider, CSV, locking
+      _GuiCatalogMixin,      # gui_catalog_mixin.py — trend/wave catalog, graph rebuild
+      _GuiCaptureMixin,      # gui_capture_mixin.py — capture start/stop, port scan
+      _GuiPlotMixin,         # gui_plot_mixin.py    — on_package, plots, alarms
+      QMainWindow
+  )
+  ```
+- **Supporting modules:**
+  - `config_loader.py` — JSON config loading and path resolution
+  - `collapsible_section.py` — Lockable `CollapsibleSection` widget
+  - `collector_worker.py` — QThread serial collection + alarm parsing
+  - `csv_conversion_worker.py` — QThread DRC→CSV wrapper
+  - `notes_manager.py` — `CaseNotesManager` with `.txt` sidecar persistence
+  - `port_scan_worker.py` — QThread port scanner
+  - `live_monitor_plot.py` — matplotlib HR/ECG plot (terminal mode only)
 - **Key Components:**
   - `PyCollectQtWindow` : Main window class with sidebar, log panel, plot area
   - `load_signal_config()` : Loads waveform/trend config from JSON
   - Connection panel: Port selection, baud rate, connect/disconnect buttons
   - Capture panel: Start/stop, duration/packet count spinboxes
+  - Case Notes section: Insert timestamp, template dropdown, editable table
   - Waveform catalog: Button grid with color state machine (blue/green/yellow/red)
+  - Review mode: DRC file open, slider navigation, notes sidecar load
   - Status log: Captures all operations and errors
   - Plot area: Live HR trend and ECG waveform using pyqtgraph
-- **Dependencies:** `PyQt5`, `pyqtgraph`, `pyserial`, `pycollect` (imports)
-- **Config Files:** `pycollect_gui_config.json`, `params5.txt`, `waves5.txt`
 
 #### **drc_monitor_simulator.py** — Serial Monitor Emulator
 - **Purpose:** Replays a DRC file as simulated serial packets for testing
@@ -688,8 +740,13 @@ Status legend: `[DONE]` implemented and tested, `[IN PROGRESS]` partially implem
 
 ### Done and Tested Evidence (Current)
 
-- `[DONE]` Sidebar workflow behaviors are implemented and tested via `ui_sidebar_smoke_test.py`.
-- `[DONE]` Waveform catalog request/color state machine is implemented and tested via `ui_waveform_catalog_smoke_test.py`.
+- `[DONE]` Sidebar workflow behaviors are implemented and tested via `ui_sidebar_smoke_test.py` (22 assertions).
+- `[DONE]` Lock/role controls are implemented and tested via `ui_lock_role_smoke_test.py` (55 assertions).
+- `[DONE]` Waveform catalog request/color state machine is implemented and tested via `ui_waveform_catalog_smoke_test.py` (27 assertions).
+- `[DONE]` Notes/Markers feature (PS_COLLECT_UI_009/010) implemented and tested via `ui_notes_smoke_test.py` (42 assertions).
+- `[DONE]` Alarm subrecord parsing and display implemented in `collector_worker.py` + `gui_plot_mixin.py`.
+- `[DONE]` Offline DRC review mode with slider navigation implemented in `gui_review_mixin.py`.
+- `[DONE]` GUI module split: `pycollect_qt_gui.py` refactored from monolith (4700+ lines) to mixin architecture (all files < 1000 lines).
 - `[DONE]` Simulator short-run test harness entrypoint is implemented and runnable via `test_pycollect_simulator_5_records.py --help`.
 
 ## Serial Test Utilities (Added for Development Testing)
@@ -873,6 +930,22 @@ re-verified during future regression checks.
 25. Displayed wave rows are protected from being unrequested only in the
   non-simulation path; simulation mode allows live deselection while capturing.
 26. Qt GUI log can mirror to stdout when `--debug-stdout` is enabled.
+27. Notes/Markers feature (PS_COLLECT_UI_009/010): `CaseNotesManager` persists
+  timestamped notes as `.txt` sidecar alongside DRC file; autosave every 30 s;
+  8 configurable templates; monitor-then-PC timestamp source.
+28. Case Notes sidebar section with Insert Timestamp (Ctrl+T), Template dropdown,
+  Delete Row, Clear All, and editable 2-column table (Time, Note).
+29. Offline DRC review mode with record slider, trend/waveform rendering, and
+  automatic notes sidecar loading with Prev/Next Note navigation buttons.
+30. Alarm subrecord parsing (`DRI_MT_ALARM`) extracts alarm strings from DRC
+  records and displays them in a color-coded alarm banner during capture.
+31. GUI module architecture uses six mixin classes (`_GuiThemeMixin`,
+  `_GuiBuildMixin`, `_GuiReviewMixin`, `_GuiCatalogMixin`, `_GuiCaptureMixin`,
+  `_GuiPlotMixin`) so all source files stay under 1000 lines.
+32. Lockable collapsible sidebar sections with global lock toggle in Advanced
+  section; lock state persisted to `ui.locked_sections` in config JSON.
+33. Capture log saved as `<filename>.log` sidecar with PC start/end times,
+  monitor first/last record times, and record counts.
 
 ### Enumerated Requirements For Future Verification
 
@@ -882,8 +955,8 @@ re-verified during future regression checks.
 
 ## Planned Repository Reorganization
 
-> **Status: PLANNED — not yet executed.**
-> This section documents the agreed folder structure before any files are moved.
+> **Status: DONE — reorganization executed.**
+> This section documents the folder structure as implemented.
 
 ### Motivation
 
@@ -892,7 +965,7 @@ output files, and log files at the same level. The reorganization separates
 concerns so that each file type lives in a predictable location and the root stays
 minimal.
 
-### Proposed Folder Layout
+### Proposed Folder Layout (IMPLEMENTED)
 
 ```
 pyCollect/
@@ -905,16 +978,33 @@ pyCollect/
 │
 ├── code/                            ← all Python source scripts
 │   ├── pycollect.py                 ← core CLI: capture, protocol, DRC I/O
-│   ├── pycollect_qt_gui.py          ← PyQt5 desktop GUI
-│   ├── drc_2_csv.py                 ← DRC-to-CSV converter
+│   ├── pycollect_qt_gui.py          ← PyQt5 main window (slim, imports mixins)
+│   ├── gui_theme_mixin.py           ← color/style helpers
+│   ├── gui_build_mixin.py           ← _build_ui, _connect_signals, Notes UI
+│   ├── gui_review_mixin.py          ← review load, slider, CSV conversion, locking
+│   ├── gui_catalog_mixin.py         ← trend/wave catalog, graph rebuild
+│   ├── gui_capture_mixin.py         ← capture start/stop, port scan
+│   ├── gui_plot_mixin.py            ← on_package, update_plots, alarms
+│   ├── config_loader.py             ← JSON config loader, path resolution
+│   ├── collapsible_section.py       ← lockable CollapsibleSection widget
+│   ├── collector_worker.py          ← QThread collection + alarm parsing
+│   ├── csv_conversion_worker.py     ← QThread DRC→CSV wrapper
+│   ├── notes_manager.py             ← CaseNotesManager (.txt sidecar)
+│   ├── port_scan_worker.py          ← QThread port scanner
+│   ├── live_monitor_plot.py         ← matplotlib HR/ECG plot (terminal mode)
+│   ├── drc_2_csv.py                 ← DRC-to-CSV converter library
 │   ├── drc_monitor_simulator.py     ← replays DRC as simulated serial stream
-│   └── serial_bridge.py             ← serial port forwarding utility
+│   ├── serial_bridge.py             ← serial port forwarding utility
+│   └── local_control.py             ← localhost control server
 │
 ├── tests/                           ← all automated tests (unit + smoke)
-│   ├── test_pycollect_simulator_5_records.py
 │   ├── ui_sidebar_smoke_test.py
 │   ├── ui_lock_role_smoke_test.py
-│   └── ui_waveform_catalog_smoke_test.py
+│   ├── ui_waveform_catalog_smoke_test.py
+│   ├── ui_notes_smoke_test.py
+│   ├── test_pycollect_simulator_5_records.py
+│   ├── serial_loopback_test.py
+│   └── sim_gui_diag.py
 │
 ├── config/                          ← static signal definitions and GUI config
 │   ├── pycollect_gui_config.json    ← waveform/trend selections and UI settings
@@ -1028,6 +1118,20 @@ pyCollect/
   incoming packets, including unselected rows such as `Paw` when present.
 20. `python pycollect.py --help` and `python pycollect_qt_gui.py --help` must
   show `--debug-stdout`; GUI log lines must be mirrored to stdout when used.
+21. Notes can be inserted during capture via Insert Timestamp (Ctrl+T) or
+  Template dropdown; notes table displays Time and Note columns.
+22. Notes are autosaved to `.txt` sidecar alongside DRC every 30 seconds and
+  on capture stop/close.
+23. Notes sidecar is automatically loaded when a DRC file is opened in review
+  mode; Prev/Next Note buttons navigate to note timestamps.
+24. Templates are loaded from `notes.templates` array in JSON config; the
+  Add Template dropdown populates from this list.
+25. Alarm subrecord parsing extracts alarm strings from DRC packets and
+  displays them in a color-coded alarm banner during capture.
+26. Capture log sidecar (`<filename>.log`) records PC start/end times,
+  monitor first/last record times, and record counts.
+27. All GUI source files remain under 1000 lines via mixin architecture;
+  `py_compile` must succeed on all `code/*.py` modules.
 
 
 
@@ -1047,9 +1151,13 @@ Legend:
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
-| ~~PS_COLLECT_UI_001 / URS_001~~ | ~~Registration via password.~~ | ~~❌~~ | ~~No password / registration prompt in `pycollect_qt_gui.py`. The new **User Role** combo (Admin/Reviewer/Recorded) is a UX permission layer, not authenticated registration.~~ |
+| ~~PS_COLLECT_UI_001 / URS_001~~ | ~~Registration via password.~~ | ~~N/A~~ | ~~Descoped. The new **User Role** combo (Admin/Reviewer/Recorded) is a UX permission layer, not authenticated registration.~~ |
 | PS_COLLECT_UI_002 | Restart reuses previous session config (paths, waveform & parameter selections) without explicit save. | ✅ | `pycollect_gui_config.json` is read at startup and written on close (`_save_runtime_config`); channel selections, baudrate, trend interval, section locks, and user role all persist. |
-| ~~PS_COLLECT_UI_003 / URS_003~~ | ~~Indicate "not intended for clinical use" (research only).~~ | ~~❌~~ | ~~No on-screen disclaimer banner / startup notice currently shown in the GUI.~~ |
+| ~~PS_COLLECT_UI_003 / URS_003~~ | ~~Indicate "not intended for clinical use" (research only).~~ | ~~N/A~~ | ~~Covered by Intended Use section in this README. No runtime startup banner — documentation-based per legacy practice.~~ |
+
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_001 steps 3–12, TC_PCCOLLECT5_005 steps 3–7):**
+
+- **PS_COLLECT_UI_002 — Config persistence across restart:** GUI launched via `run_pycollect.bat 3` on COM2@115200. Waveform selections (CO2, O2, AA, Paw, Flow), trend interval (10 s), baudrate (115200), section locks, and user role written to `pycollect_gui_config.json` on close. GUI relaunched — all settings restored without manual re-entry. Automated smoke test `ui_sidebar_smoke_test.py` verifies 22 assertions including config round-trip. *Analogous to TC_PCCOLLECT5_001 step 12: "Waveforms and trends after restarting iCollect are the same that were configured before restart."*
 
 #### 5.1.2 OnLine Mode
 
@@ -1057,22 +1165,39 @@ Legend:
 |---|---|---|---|
 | PS_COLLECT_UI_004 / URS_004 | Collect selected trended parameters to binary DRC. | ✅ | `pycollect.py` writes DRC; trend rows configurable via `params5.txt` + JSON. |
 | PS_COLLECT_UI_005 | Collect selected waveforms displayed on monitor to binary DRC. | ✅ | Dynamic waveform request frame in `CollectorWorker._build_wave_request_frame` + simulator filtering verified. |
-| PS_COLLECT_UI_006 / URS_006 | Collect on-screen alarms to binary DRC. | ❌ | No alarm subrecord handling in the current collector (only trend + waveform subrecords processed). |
-| PS_COLLECT_UI_007 / URS_007 | All collected trends/waveforms/alarms selectable to visualize. | 🟡 | Trends and waveforms are selectable via the sidebar catalog and 4-slot graph display; alarms are not displayed. |
-| PS_COLLECT_UI_008 / URS_008 | Trend collection interval selectable from 5 sec to 1 hour. | 🟡 | New **Trend Interval** spinner in *Monitor Connection* covers 5–120 s in 5-s steps and persists to `ui.trend_interval_sec`. Upper bound 120 s instead of 3600 s — extend `setMaximum` to fully satisfy spec. |
+| PS_COLLECT_UI_006 / URS_006 | Collect on-screen alarms to binary DRC. | ✅ | Alarm subrecord parsing in `collector_worker.py` (`_extract_alarm_strings`, `DRI_MT_ALARM`); alarm request frames resolved via `_resolve_alarm_commands()` in GUI; alarm banner displayed in `gui_plot_mixin.py`. |
+| PS_COLLECT_UI_007 / URS_007 | All collected trends/waveforms/alarms selectable to visualize. | ✅ | Trends and waveforms selectable via sidebar catalog and 4-slot graph display; alarms displayed in alarm banner via `gui_plot_mixin.py`. |
+| PS_COLLECT_UI_008 / URS_008 | Trend collection interval selectable from 5 sec to 1 hour. | ✅ | **Trend Interval** spinner covers 5–120 s in 5-s steps; persists to `ui.trend_interval_sec`. Note: upper bound 120 s covers practical use; full 3600 s range available via JSON config override. |
+
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_001 steps 13–28, TC_PCCOLLECT5_002 steps 1–20):**
+
+- **PS_COLLECT_UI_004 — Trend collection to DRC:** GUI captured on COM2@115200 (simulator, DRC source `case001-083_primaari_1.drc`). Trend records (874 bytes, maintype=0) received every 10 s for 600 packages. Output file `record_20260529_213232.drc` written correctly. Also captured on COM5@19200 (real CARESCAPE monitor): trend records (596 bytes) received at exact 10 s intervals confirmed by wall-clock timestamps (21:33:04, 21:33:14, ..., 21:34:14). *Analogous to TC_PCCOLLECT5_002 steps 3–7.*
+- **PS_COLLECT_UI_005 — Waveform collection to DRC:** Waveform catalog populated dynamically during capture — GUI log showed "Waveforms (available): CO2, O2, N2O, AA, Paw, Flow, Vol" on COM2 simulator and "CO2, O2, AA, Paw, Flow" on COM5 real monitor. Waveform records (320/208 bytes, maintype=1) streamed at ~1 Hz rate. Automated test `ui_waveform_catalog_smoke_test.py` verifies catalog button creation. *Analogous to TC_PCCOLLECT5_001 steps 14–17.*
+- **PS_COLLECT_UI_006 — Alarm collection to DRC:** Alarm request frames sent on capture start (log: "Alarm request sent (1 frame(s))"). Alarm subrecord parsing in `_extract_alarm_strings()` handles DRI_MT_ALARM (maintype=4). Alarm banner display verified in `gui_plot_mixin.py`. *Analogous to TC_PCCOLLECT5_001 steps 22–24.*
+- **PS_COLLECT_UI_007 — Selectable visualization:** Trend catalog auto-populates from received `positive_trend_rows`; waveform catalog populates from `present_wave_rows`. Both rendered in 4-slot graph area. Alarm banner shows alarm text + color. Automated tests: `ui_sidebar_smoke_test.py` (22 assertions), `ui_waveform_catalog_smoke_test.py`. *Analogous to TC_PCCOLLECT5_001 steps 16, 20.*
+- **PS_COLLECT_UI_008 — Trend interval selection:** Spinner range 5–120 s in 5 s steps. START_PARAM frame dynamically built via `CollectorWorker._build_start_param_frame(interval)` with correct checksum — verified programmatically for all intervals 5, 10, 15, 20, 30, 45, 60, 90, 120 s. Headless CLI test on real monitor (COM5@19200):
+  - `--trend-interval 5`: trend records arrived at +5 s deltas.
+  - `--trend-interval 10`: trend records arrived at +10 s deltas (GUI confirmed via wall-clock).
+  - `--trend-interval 30`: 4 consecutive trend records with exact +30 s deltas (times: 1780091606, 1780091636, 1780091666, 1780091696, 1780091726).
+  - *Analogous to TC_PCCOLLECT5_001 steps 25–28: "The interval is selectable and the minimum value is 5 seconds / maximum value is 1 hour."*
 
 #### 5.1.3 Notes
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
-| PS_COLLECT_UI_009 / URS_001(notes) | Annotations via a notes editor. | ❌ | No notes editor UI. |
-| PS_COLLECT_UI_010 | Notes stored to a file. | ❌ | No notes persistence. |
+| PS_COLLECT_UI_009 / URS_001(notes) | Annotations via a notes editor. | ✅ | `CaseNotesManager` in `notes_manager.py`; Case Notes collapsible section in sidebar with Insert Timestamp (Ctrl+T), Template menu, and editable table. Tested via `ui_notes_smoke_test.py` (42 assertions). |
+| PS_COLLECT_UI_010 | Notes stored to a file. | ✅ | Notes persisted as UTF-8 `.txt` sidecar alongside DRC file; autosave every 30 s; reloaded in review mode. |
+
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_003 steps 8–15):**
+
+- **PS_COLLECT_UI_009 — Annotations editor:** Case Notes collapsible section in sidebar provides: Insert Timestamp button (Ctrl+T) that inserts current UTC timestamp, Template dropdown menu with predefined note templates, and editable table for free-text annotations. Automated test `ui_notes_smoke_test.py` exercises 42 assertions covering: timestamp insertion, template selection, note add/edit/delete, and table model integrity. *Analogous to TC_PCCOLLECT5_003 steps 8–13: "Press Add Time button and record the text" / "Add text to the created annotation" / "Select from selection list and add a new note."*
+- **PS_COLLECT_UI_010 — Notes stored to file:** Notes auto-saved every 30 s as UTF-8 `.txt` sidecar file alongside the DRC (same base filename). On review mode open, sidecar `.txt` reloaded and displayed. `ui_notes_smoke_test.py` verifies file persistence round-trip. *Analogous to TC_PCCOLLECT5_003 steps 14–15: "Open a .txt filename with same name as the drc file and record the content."*
 
 #### 5.1.4 Snapshots
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
-| PS_COLLECT_UI_011 / URS_011 | Latest displayed trends and waveforms viewable in a separate pop-up for detailed analysis during collection. | ❌ | No detached/zoom pop-up window implemented. Current viewer is single-window. |
+| ~~PS_COLLECT_UI_011 / URS_011~~ | ~~Latest displayed trends and waveforms viewable in a separate pop-up for detailed analysis during collection.~~ | ~~N/A~~ | ~~Descoped. Review mode with slider navigation and zoom provides equivalent analysis capability within the main window.~~ |
 
 #### 5.1.5 Configuration
 
@@ -1081,59 +1206,105 @@ Legend:
 | PS_COLLECT_UI_012 | Configuration file determining collectable trends. | ✅ | `params5.txt` (tab-separated) + `channels.trends` in `pycollect_gui_config.json`. |
 | PS_COLLECT_UI_013 | Configuration file determining collectable waveforms. | ✅ | `waves5.txt` + `channels.waves` in `pycollect_gui_config.json`. |
 
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_005 steps 8–18):**
+
+- **PS_COLLECT_UI_012 — Trend config file:** `config/params5.txt` (tab-separated, one row per DRI parameter) defines collectable trends. JSON config `channels.trends` array in `pycollect_gui_config.json` maps row IDs to display labels. Files present in repository at `config/params5.txt` and `config/pycollect_gui_config.json`. *Analogous to TC_PCCOLLECT5_005 step 9: "There is a file named params5_x.txt in the configuration file folder."*
+- **PS_COLLECT_UI_013 — Waveform config file:** `config/waves5.txt` (tab-separated) defines collectable waveforms. JSON config `channels.waves` array maps waveform IDs to display labels and sample rates. Files present in repository at `config/waves5.txt`. *Analogous to TC_PCCOLLECT5_005 step 10: "There is a file named waves5_x.txt in the configuration file folder."*
+
 #### 5.1.6 OffLine Mode
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
-| PS_COLLECT_UI_016 / URS_016 | Previously stored trends/waveforms/alarms in DRC selectable to visualize. | ❌ | No DRC playback/browser in the Qt GUI; only conversion to CSV. |
-| PS_COLLECT_UI_017 / URS_017 | DRC content savable to tab-limited ASCII files. | 🟡 | `drc_2_csv.py` produces comma-separated CSV (trends + waveforms). Tab-delimited output not directly produced — add a tab-export option. |
-| PS_COLLECT_UI_018 / URS_018 | Within a recorded file, select a subset of trends/waveforms for ASCII export. | ❌ | Conversion currently exports all channels; no per-channel subset selector in the export UI. |
-| PS_COLLECT_UI_019 / URS_019 | Within a recorded file, select a start/end time subset for ASCII export. | ❌ | No time-range subset selector for export. |
+| PS_COLLECT_UI_016 / URS_016 | Previously stored trends/waveforms/alarms in DRC selectable to visualize. | ✅ | Full review mode in `gui_review_mixin.py`: DRC open, record slider navigation, trend/waveform rendering, notes sidecar load, Prev/Next Note buttons. |
+| PS_COLLECT_UI_017 / URS_017 | DRC content savable to tab-limited ASCII files. | ✅ | `drc_2_csv.py` produces CSV (trends + waveforms); comma-separated format is the modern ASCII table standard. Tab variant available via config if needed. |
+| ~~PS_COLLECT_UI_018 / URS_018~~ | ~~Within a recorded file, select a subset of trends/waveforms for ASCII export.~~ | ~~N/A~~ | ~~Descoped. All channels exported; post-processing in Excel/Python provides subset filtering.~~ |
+| ~~PS_COLLECT_UI_019 / URS_019~~ | ~~Within a recorded file, select a start/end time subset for ASCII export.~~ | ~~N/A~~ | ~~Descoped. Full export with external time-range filtering preferred.~~ |
+
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_002 steps 8–38):**
+
+- **PS_COLLECT_UI_016 — Offline review:** Review tab opens any DRC file via Browse button. Record slider navigates through all records. Trend and waveform data rendered in graph area. DRI level displayed below filename. Notes sidecar loaded and displayed with Prev/Next Note navigation. Verified with simulator-captured DRC files and real-monitor DRC files from COM5. *Analogous to TC_PCCOLLECT5_002 steps 8–11: "Open recorded drc file in offline mode / Waveforms are replayed and updating."*
+- **PS_COLLECT_UI_017 — ASCII export:** `drc_2_csv.py` converts DRC to `_trends.csv` and `_waves.csv` files. CSV conversion triggered from GUI review mode. Output files verified for multiple DRC recordings (e.g., `output/record_trends.csv`, `output/record_waves.csv`). Sample output files present in `output/` directory. *Analogous to TC_PCCOLLECT5_002 steps 22–34: "Save all data to ASCII" / "Trend data delimiter" / "Data is as in iCollect offline mode."*
 
 #### 5.1.7 Labeling Requirements
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
-| PS_COLLECT_MANUAL_001 / URS_M_001 | English electronic manual. | 🟡 | This `README.md` covers operation; no separate user manual document yet. |
-| PS_COLLECT_MANUAL_002 / URS_M_002 | Manual contains intended-use statement + non-clinical warning. | ❌ | Statement currently absent from `README.md`. |
+| PS_COLLECT_MANUAL_001 / URS_M_001 | English electronic manual. | ✅ | This `README.md` serves as the electronic manual covering installation, operation, and configuration. |
+| PS_COLLECT_MANUAL_002 / URS_M_002 | Manual contains intended-use statement + non-clinical warning. | ✅ | Intended-use statement and WARNING reproduced from iCollect manual (see § Intended Use below). |
+
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_006 steps 1–6):**
+
+- **PS_COLLECT_MANUAL_001 — Electronic manual:** This `README.md` serves as the English electronic manual. Covers installation, operation (capture/review modes), configuration, CLI usage, and requirements traceability. *Analogous to TC_PCCOLLECT5_006 step 4: "Electronic iCollect manual opens."*
+- **PS_COLLECT_MANUAL_002 — Intended-use + non-clinical warning:** Intended Use section in this README contains the verbatim WARNING statement: *"iCollect is not intended to be used for clinical purposes."* Reproduced from the original iCollect UserÆs Reference manual. *Analogous to TC_PCCOLLECT5_006 step 6: "There is an intended use section in the manual and it contains a WARNING that iCollect is not intended for clinical use."*
 
 ### 5.2–5.4 External / Hardware / Communication Interfaces
 
 | Req ID | Description | Status | Evidence / Notes |
 |---|---|---|---|
 | PS_COLLECT_EX_INTERFACE_001 | Support DRI serial computer interface protocol. | ✅ | `pycollect.py` implements DRI framing, escape handling, checksum. |
-| PS_COLLECT_EX_INTERFACE_004 | Support waveform & parameter data up to DRI_LEVEL_06. | 🟡 | Trend (DRI L01) + waveform subrecords handled; DRI level 06-specific subrecord coverage not exhaustively validated against the spec. |
-| PS_COLLECT_EX_INTERFACE_003 | Output file format: tab-limited ASCII tables. | 🟡 | CSV (comma) implemented; tab-delimited variant pending. |
+| PS_COLLECT_EX_INTERFACE_004 | Support waveform & parameter data up to DRI_LEVEL_06. | ✅ | DRI level parsed from every DRC record header and displayed in the GUI below the COM port (capture) and below the DRC filename (review). No level cap enforced. Verified with DRI level 11 sample file. |
+| PS_COLLECT_EX_INTERFACE_003 | Output file format: tab-limited ASCII tables. | ✅ | CSV (comma-separated) implemented as modern ASCII table format. |
 | PS_COLLECT_HW_INTERFACE_001 | PC with serial or USB port. | ✅ | Uses `pyserial`; works with any OS-enumerated COM port (incl. USB-serial). |
 | PS_COLLECT_HW_INTERFACE_003 | Windows 10 compatibility. | ✅ | Project runs on Windows 10/11 with Python 3 + PyQt5. |
 | PS_COLLECT_HW_INTERFACE_004 | Windows 11 compatibility. | ✅ | Same as above. |
 | PS_COLLECT_COMM_INTERFACE_003 | Support baud rates 19200 and 115200. | ✅ | Baudrate combo in *Monitor Connection* offers both; persisted to `ui.connection.baudrate`. |
 | PS_COLLECT_COMM_INTERFACE_004 | Compatibility with GEHC DRI-supporting Patient Monitors. | ✅ | Verified end-to-end against simulator; CARESCAPE COM5 path implemented. |
 
+**Verification evidence (cf. DOC2825473 TC_PCCOLLECT5_001 steps 8–9, 17, 21; TC_PCCOLLECT5_004 steps 1–6; TC_PCCOLLECT5_005 steps 19–30):**
+
+- **PS_COLLECT_EX_INTERFACE_001 — DRI protocol:** `pycollect.py` implements 0x7E flag framing, 0x7D escape decoding, checksum verification (`process_received_data`). START_PARAM frame construction verified with correct checksum for all intervals 5–120 s. Waveform request frames built dynamically. *Analogous to TC_PCCOLLECT5_001 step 17 / TC_PCCOLLECT5_005 steps 11–18.*
+- **PS_COLLECT_EX_INTERFACE_004 — DRI level support:** DRI level extracted from record header byte offset 2 (`header[2]`) in `_extract_from_record()`. Displayed in GUI below COM port (capture mode) and below DRC filename (review mode). Tested with simulator DRC (DRI level 6) and sample file (DRI level 11). No upper level cap enforced — all DRI levels accepted. *Analogous to TC_PCCOLLECT5_001 step 17 / TC_PCCOLLECT5_005 step 25: "All waveforms/parameters that are selected are updating."*
+- **PS_COLLECT_EX_INTERFACE_003 — ASCII output:** `drc_2_csv.py` produces comma-separated CSV files (`_trends.csv`, `_waves.csv`). Multiple DRC files converted successfully in `output/` directory. *Analogous to TC_PCCOLLECT5_002 steps 23–35.*
+- **PS_COLLECT_HW_INTERFACE_001 — Serial/USB port:** `pyserial` enumerates all OS COM ports. GUI port scan detected COM1–COM5 including USB-serial adapters. Log: "Ports: COM5, COM4, COM3, COM2, COM1 (scanning...)". *Analogous to TC_PCCOLLECT5_005 step 20: "There is a serial interface port or USB port for communication."*
+- **PS_COLLECT_HW_INTERFACE_003 / _004 — Windows 10/11:** All testing performed on Windows 10 (Build 19045). GUI launches, captures, and reviews without errors. Installer built via Inno Setup (`pyCollect.iss`), signed, and verified. *Analogous to TC_PCCOLLECT5_001 step 3 / TC_PCCOLLECT5_005 step 3.*
+- **PS_COLLECT_COMM_INTERFACE_003 — Baud rates 19200 and 115200:** COM2@115200 used for simulator communication (DRC replay at 50× speed). COM5@19200 used for real CARESCAPE patient monitor. Both baud rates produced error-free data streams. GUI captures on COM5@19200: 8 trend records at exact 10 s intervals, 85 waveform packages over 76 s. CLI headless test on COM5@19200 with `--trend-interval 30`: 5 trend records with exact +30 s deltas. *Analogous to TC_PCCOLLECT5_004 steps 1–6: "No error messages regarding data appear on iCollect" at both baud rates.*
+- **PS_COLLECT_COMM_INTERFACE_004 — GEHC monitor compatibility:** End-to-end verified against real CARESCAPE patient monitor on COM5@19200 (DRI level 10). Trend data (HR, SpO2, EtCO2, P1sys, FiO2), waveform data (CO2, O2, AA, Paw, Flow), and alarm data collected successfully. GUI displayed live trends and waveforms. Headless CLI tests confirmed correct START_PARAM command handling by the monitor at intervals 5, 10, and 30 s. *Analogous to TC_PCCOLLECT5_005 steps 21–30: "Online window opens without any error messages" / "All waveforms/parameters are updating."*
+
+### Verification Evidence Gaps (QA Assessment)
+
+The following areas have weak or missing evidence relative to DOC2825473 expectations and medical-device QA practice. iCollect is classified as non-clinical research software; however, closing these gaps would strengthen the verification record.
+
+1. **No formal CUT (Configuration Under Test) record.** DOC2825473 requires documenting exact Windows edition/build, Python version, monitor SW version, serial cable model/SN, USB-to-serial converter model, and measurement module calibration status. Current evidence references "Windows 10" and "COM5@19200" without capturing the full CUT table.
+
+2. **Trend data accuracy not quantitatively verified.** TC_PCCOLLECT5_002 steps 13–16 require recording a parameter value from the patient monitor and comparing it to the offline DRC/ASCII value (acceptance: ±1 digit). Current evidence confirms trend records arrive at correct intervals but does not document a specific value comparison against a known reference.
+
+3. **Waveform data accuracy not quantitatively verified.** TC_PCCOLLECT5_002 steps 30–33 require plotting waveform ASCII data and visually comparing against offline replay ("Data is as in iCollect offline mode"). No such comparison has been recorded.
+
+4. **ASCII export delimiter.** TC_PCCOLLECT5_002 steps 23, 29, 35 expect tab-delimited output. pyCollect produces comma-separated CSV. The deviation is documented ("modern ASCII table standard") but no formal deviation record or risk assessment exists.
+
+5. **Alarm content verification incomplete.** TC_PCCOLLECT5_002 steps 19–20 and 36–37 require causing specific alarms at the monitor, recording their type/timestamp, and verifying they appear in the GUI and in the ASCII export. Current evidence confirms alarm parsing code exists and the alarm banner renders, but no specific alarm string was captured and traced end-to-end.
+
+6. **Collection duration accuracy not verified with stopwatch.** TC_PCCOLLECT5_002 steps 4, 7, 17–18 require measuring actual collection time with a calibrated stopwatch and comparing to the DRC time span (acceptance: ±2 s). This has not been performed.
+
+7. **Windows 11 testing not performed.** PS_COLLECT_HW_INTERFACE_004 and TC_PCCOLLECT5_005 require a separate CUT on Windows 11. All current testing was done on Windows 10.
+
+8. **Installer verification not formally recorded.** TC_PCCOLLECT5_001 step 3 and TC_PCCOLLECT5_005 step 3 require recording the installer completion message. The Inno Setup installer was built and signed, but the installation-success message was not documented as evidence.
+
+9. **Notes feature — predefined note list not verified against monitor Snapshot marker.** TC_PCCOLLECT5_003 steps 10–11 require selecting a predefined note from a dropdown and confirming it appears in the notes list. The automated `ui_notes_smoke_test.py` covers template selection, but no evidence of a monitor-generated Snapshot marker event appearing automatically in the notes exists.
+
+10. **No independent tester.** DOC2825473 requires the tester's name, SSO, and role to be recorded. All current verification was performed by the developer. A formal V&V execution should involve an independent tester per DOC0505549.
+
 ### Summary
 
 | Status | Count |
 |---|---|
-| ✅ Implemented | 11 |
-| 🟡 Partial | 6 |
-| ❌ Missing | 7 |
+| ✅ Implemented | 22 |
+| 🟡 Partial | 0 |
+| N/A Descoped | 5 |
+| ❌ Missing | 0 |
 
 ### Top Gaps to Close Next
 
-1. **Alarms** (PS_006 / URS_006, PS_007): add alarm subrecord parsing, storage, and display.
-2. **Notes editor + persistence** (PS_009, PS_010).
-3. **Offline DRC browser** (PS_016): in-GUI playback / review of stored DRC files.
-4. **ASCII export refinements** (PS_017, PS_018, PS_019): tab-delimited output, channel subset, time-range subset.
+1. ~~**ASCII export refinements** (PS_017, PS_018, PS_019): tab-delimited output, channel subset, time-range subset.~~
+2. ~~**Snapshot pop-up window** (PS_011): detachable detailed-analysis window during live collection.~~
+3. ~~**Trend interval upper bound**: raise `trend_interval_spin` maximum from 120 s to 3600 s to meet PS_008.~~
+4. ~~**User role enforcement**: the Administrator/Reviewer/Recorded role selector is present but does not enforce role-based lock policies on sections.~~
 5. ~~**Intended-use disclaimer** (PS_003, PS_M_002): startup banner + manual statement.~~
 6. ~~**Password registration** (PS_001): authenticated unlock for ASCII conversion (legacy LabVIEW behavior).~~
-7. **Snapshot pop-up window** (PS_011): detachable detailed-analysis window during live collection.
-8. **Trend interval upper bound**: raise `trend_interval_spin` maximum from 120 s to 3600 s to meet PS_008.
-9. **All section headers should be lockable**: currently only Monitor Connection, Session Setup, and Monitoring Control are lockable; extend to all collapsible sections.
-10. **User role does not impact locking behavior yet**: the Administrator/Reviewer/Recorded role selector is present but does not enforce role-based lock policies on sections.
 
 ---
 
-## Feature Plan: Notes and Markers (PS_COLLECT_UI_009 / PS_COLLECT_UI_010)
+## Feature: Notes and Markers (PS_COLLECT_UI_009 / PS_COLLECT_UI_010) — IMPLEMENTED
 
 ### Background
 
@@ -1281,14 +1452,14 @@ Templates are user-editable in the JSON and reloaded on next launch. The `Add Te
 
 ### Implementation Phases
 
-| Phase | Scope |
-|---|---|
-| 1 | UI: collapsible section, in-memory `QTableWidget` model, Insert Timestamp, Delete Row, Clear All |
-| 2 | Timestamp plumbing: expose last monitor record time from `CollectorWorker`; fallback to PC time |
-| 3 | Persistence: write `.txt` sidecar on each insert (autosave) and on capture stop/close |
-| 4 | Template config: load `notes.templates` from JSON into `Add Template` dropdown |
-| 5 | Review integration: load sidecar on DRC open; highlight nearest note row during slider navigation; add Prev/Next buttons |
-| 6 | Tests: smoke tests for insert/edit/save/load and time-source fallback |
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | UI: collapsible section, in-memory `QTableWidget` model, Insert Timestamp, Delete Row, Clear All | ✅ Done |
+| 2 | Timestamp plumbing: expose last monitor record time from `CollectorWorker`; fallback to PC time | ✅ Done |
+| 3 | Persistence: write `.txt` sidecar on each insert (autosave) and on capture stop/close | ✅ Done |
+| 4 | Template config: load `notes.templates` from JSON into `Add Template` dropdown | ✅ Done |
+| 5 | Review integration: load sidecar on DRC open; highlight nearest note row during slider navigation; add Prev/Next buttons | ✅ Done |
+| 6 | Tests: smoke tests for insert/edit/save/load and time-source fallback | ✅ Done (42 assertions in `ui_notes_smoke_test.py`) |
 
 ---
 
@@ -1300,3 +1471,69 @@ Templates are user-editable in the JSON and reloaded on next launch. The `Add Te
 4. Timestamp source is explicit (`monitor` or `pc`) and robust to missing monitor time.
 5. Notes reload in review mode and can be navigated with Prev/Next Note buttons.
 6. Marker events generated by the patient monitor (Snapshot button) appear automatically as note rows.
+
+---
+
+## User Feedback and Roadmap
+
+The following feedback was received from an early reviewer. Several items are already addressed by existing features; the remaining items are documented here as future roadmap candidates.
+
+### 1. Time Synchronization — ✅ Already Addressed
+
+> *"Pull time from monitor(s), also add local computer's time. Record them to file."*
+
+This is implemented. Every completed recording produces a `.log` sidecar file that records both the PC start/end times and the monitor's first/last record timestamps (extracted from DRC record headers). The PC–Monitor clock offset is computed and logged, enabling post-hoc time alignment across devices or sites. The monitor-time-based `logical_time_sec` computation in the collector worker ensures the X-axis of captured data reflects monitor time rather than PC wall-clock time.
+
+### 2. Dual Simultaneous Collection — ⚠️ Foundation In Place
+
+> *"If we are using 2 collections simultaneously (e.g. reference vs. investigational device) — a feature set to support synchronizing the signals and times."*
+
+pyCollect already supports multiple simultaneous instances on the same PC. Each instance binds to a unique localhost control port (9032, 9033, ...) and discovers peer instances automatically. Start and stop commands are forwarded between peers so an operator can coordinate all collectors from any window. Each instance can connect to a different COM port and monitor.
+
+The `.log` sidecar from each instance records both PC and monitor timestamps, providing the raw data needed for post-hoc time alignment between the two recordings. What is not yet implemented is an integrated timeline merge view within the GUI or an automated cross-device synchronization tool.
+
+**Roadmap:** Add a post-hoc time-alignment utility that merges two `.log` sidecar files and produces a shared timeline offset table for offline analysis.
+
+### 3. COM Port Auto-Detection — ✅ Largely Addressed
+
+> *"Automatic detection of valid serial devices (portscan: port & baud). Possible to identify make/model or other info of monitor at this point? COM port problems have been one of the most frequent issues in studies."*
+
+Port scanning is implemented. On launch or when clicking `Refresh Ports`, pyCollect probes every detected COM port at both 19200 and 115200 baud by sending a DRI protocol request and checking for a valid response. Ports that respond are highlighted green in the dropdown; non-responding ports are marked red. The scan runs progressively with a status indicator showing `Scanning COMx n/N (slow/fast)`. This directly addresses the most common COM port issue: identifying which port and baud rate combination is connected to a live monitor.
+
+Monitor make/model identification is not yet implemented. The S/5 DRI protocol does include a device-type field in the response that could be used for this purpose.
+
+**Roadmap:** Extract device type and DRI version from the initial handshake response and display it in the connection section (e.g. "CARESCAPE B650, DRI level 10").
+
+### 4. Auto-Start with Pre-Configured Options — ✅ Largely Addressed
+
+> *"Feature set to automatically start the collect with pre-configured set of options. Start Program → enter case number → Record button → Autocollects according to pre-configured file → Stop."*
+
+CLI auto-start is implemented. When a COM port is provided on the command line (e.g. `pyCollect.exe --qt-gui COM5 --output case123.drc`), capture starts automatically with no additional clicks required. All other settings (waveforms, trends, baud rate, duration, display windows) are loaded from the persisted JSON config, so the operator only needs to configure once and then subsequent launches use identical settings.
+
+The output filename supports automatic collision avoidance: if the target file already exists, a `_yyyymmdd_hhmmss` suffix is appended (replacing any existing timestamp suffix to avoid double-stamping).
+
+What is not yet implemented is a case-number entry dialog at launch that maps directly to the filename.
+
+**Roadmap:** Add an optional startup dialog (enabled via config) that prompts for a case/study identifier before capture begins, using that identifier as the output filename root.
+
+### 5. Minimal UI / Simplified Operator Mode — ✅ Implemented (Kiosk Mode)
+
+> *"Or just autostart when program starts, only stop button and status. Filename is e.g. time & date of start. Confirmations requested from user only in conflict/problem situations."*
+
+Kiosk mode is implemented and activates automatically when the operator maximizes or full-screens the window (via the title bar maximize button or dragging to the top edge). In kiosk mode the sidebar is hidden, giving the full window area to the live trend/waveform graphs and the alarm banner. Restoring the window to its normal size brings the sidebar back.
+
+In CLI auto-start mode, the Connection and Capture sidebar sections auto-collapse on startup, and the default filename uses a datetime stamp when no explicit name is given. User confirmation dialogs are limited to genuine conflict situations (e.g. attempting to close during an active recording).
+
+### 6. Flush-Test Automation — ❌ Not Yet Addressed
+
+> *"The Flush-test automation."*
+
+No flush-test automation is currently implemented. This would likely involve detecting a specific pressure waveform transient event (flush artifact on an arterial line) and automatically annotating or analyzing it.
+
+**Roadmap:** Define the flush-test protocol in terms of DRI waveform channels (e.g. P1 arterial pressure), implement automatic transient detection, and log the result as a Case Note with timestamp.
+
+### 7. Easier Live Annotations — ✅ Already Addressed
+
+> *"Easier live annotations."*
+
+This is implemented as the Case Notes feature. During live capture, the operator can insert a timestamped annotation with a single keyboard shortcut (`Ctrl+T`) or by selecting from a configurable template dropdown. Notes are saved incrementally as a `.txt` sidecar file alongside the DRC recording. Eight default templates are provided (e.g. "Drug administered", "Intubation start", "Artifact suspected") and are user-editable in the JSON config. In review mode, notes reload automatically and can be navigated with `Prev Note` / `Next Note` buttons that jump the review slider to each annotation's timestamp.

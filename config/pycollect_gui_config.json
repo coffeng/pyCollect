@@ -10,6 +10,21 @@
     }
   },
   "user_role": "Administrator",
+  "notes": {
+    "enabled": true,
+    "default_time_source": "monitor_then_pc",
+    "autosave_interval_sec": 30,
+    "templates": [
+      "Drug administered",
+      "Intubation start",
+      "Artifact suspected",
+      "Position changed",
+      "Manual event",
+      "SpO2 probe replaced",
+      "BP cuff inflated",
+      "Ventilator change"
+    ]
+  },
   "colors": {
     "theme": "dark_medical",
     "sidebar": {
@@ -207,9 +222,9 @@
     }
   },
   "ui": {
-    "duration_sec": 60,
-    "trend_window_sec": 60,
-    "wave_window_sec": 30.0,
+    "duration_sec": 15,
+    "trend_window_sec": 45,
+    "wave_window_sec": 300.0,
     "trend_interval_sec": 120,
     "section_locks": {
       "monitor_connection": false,
@@ -256,22 +271,6 @@
         "row_identifier": 158
       }
     ],
-    "waves": [
-      {
-        "row_identifier": 1
-      },
-      {
-        "row_identifier": 4
-      },
-      {
-        "row_identifier": 9
-      },
-      {
-        "row_identifier": 13
-      },
-      {
-        "row_identifier": 14
-      }
-    ]
+    "waves": []
   }
 }

@@ -1,5 +1,4 @@
 import argparse
-import collections
 import json
 import os
 import re
@@ -13,6 +12,8 @@ from pathlib import Path
 
 import serial  # pyserial is assumed to be available
 
+from config_loader import _startup_log, _startup_log_path, _runtime_search_roots as _runtime_roots
+
 
 FLAG_CHAR = 0x7E
 ESCAPE_CHAR = 0x7D
@@ -20,45 +21,6 @@ ESCAPE_MOD = 0x20
 DATA_INVALID = -32760
 DRI_MAX_SUBRECS = 8
 
-
-def _runtime_roots():
-    roots = []
-
-    if getattr(sys, "frozen", False):
-        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            local_root = Path(local_appdata) / "pyCollect"
-            roots.append(local_root)
-            roots.append(local_root / "config")
-
-        exe_dir = Path(sys.executable).resolve().parent
-        roots.append(exe_dir)
-        roots.append(exe_dir / "config")
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            roots.append(Path(meipass).resolve())
-            roots.append((Path(meipass).resolve() / "config"))
-        roots.append(Path.cwd().resolve())
-    else:
-        roots.append(Path.cwd().resolve())
-        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            local_root = Path(local_appdata) / "pyCollect"
-            roots.append(local_root)
-            roots.append(local_root / "config")
-        repo_root = Path(__file__).resolve().parent.parent
-        roots.append(repo_root)
-        roots.append(repo_root / "config")
-
-    unique = []
-    seen = set()
-    for root in roots:
-        key = str(root).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(root)
-    return unique
 
 
 def resolve_gui_config_path(config_path=None):
@@ -89,175 +51,9 @@ def resolve_gui_config_path(config_path=None):
     return None
 
 
-def _startup_log_path() -> Path:
-    base_dir = Path(__file__).resolve().parent.parent
-    if getattr(sys, "frozen", False):
-        base_dir = Path(sys.executable).resolve().parent
-    out_dir = base_dir / "output"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir / "pycollect_startup.log"
 
 
-def _startup_log(message):
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with _startup_log_path().open("a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {message}\n")
-    except Exception:
-        pass
-
-
-class LiveMonitorPlot:
-    """Simple live plot for first detected heart rate and ECG waveform."""
-
-    def __init__(
-        self,
-        hr_window_points=10,
-        ecg_window_samples=5000,
-        refresh_interval_sec=10,
-        keep_foreground=True,
-    ):
-        try:
-            import matplotlib.pyplot as plt
-        except Exception as exc:
-            raise RuntimeError(
-                "GUI mode requires matplotlib. "
-                "Install it with: pip install matplotlib"
-            ) from exc
-
-        self.plt = plt
-        self.hr_points = collections.deque(maxlen=hr_window_points)
-        self.ecg_points = collections.deque(maxlen=ecg_window_samples)
-        self.refresh_interval_sec = max(1, int(refresh_interval_sec))
-        self.keep_foreground = keep_foreground
-        self.last_draw_time = 0.0
-
-        self.plt.ion()
-        self.fig, (self.ax_hr, self.ax_ecg) = self.plt.subplots(
-            2,
-            1,
-            figsize=(10, 6),
-        )
-        self.fig.suptitle("pycollect Live View")
-
-        self.hr_line, = self.ax_hr.plot([], [], "b-")
-        self.ax_hr.set_title("Heart Rate (first detected trend value)")
-        self.ax_hr.set_ylabel("bpm")
-        self.ax_hr.grid(True, alpha=0.3)
-        self.ax_hr.set_xlim(0, max(10, hr_window_points))
-        self.ax_hr.set_ylim(40, 140)
-
-        self.ecg_line, = self.ax_ecg.plot([], [], "r-")
-        self.ax_ecg.set_title("ECG Waveform (first detected wave channel)")
-        self.ax_ecg.set_ylabel("raw")
-        self.ax_ecg.set_xlabel("sample")
-        self.ax_ecg.grid(True, alpha=0.3)
-        self.ax_ecg.set_xlim(0, max(200, ecg_window_samples))
-        self.ax_ecg.set_ylim(-100, 100)
-
-        self.status_text = self.fig.text(
-            0.5,
-            0.01,
-            "Waiting for HR/ECG data...",
-            ha="center",
-            va="bottom",
-        )
-
-        self.fig.tight_layout()
-        self.fig.canvas.draw()
-        self._show_and_raise_window()
-        self._draw(force=True)
-
-    def _show_and_raise_window(self):
-        self.plt.show(block=False)
-        manager = self.fig.canvas.manager
-        window = getattr(manager, "window", None)
-
-        if window is None:
-            return
-
-        if not self.keep_foreground:
-            return
-
-        # Try Qt window controls first; fallback to Tk if available.
-        try:
-            if hasattr(window, "showNormal"):
-                window.showNormal()
-            if hasattr(window, "raise_"):
-                window.raise_()
-            if hasattr(window, "activateWindow"):
-                window.activateWindow()
-        except Exception:
-            pass
-
-        try:
-            if hasattr(window, "attributes"):
-                window.attributes("-topmost", 1)
-                window.attributes("-topmost", 0)
-            if hasattr(window, "wm_attributes"):
-                window.wm_attributes("-topmost", 1)
-                window.wm_attributes("-topmost", 0)
-        except Exception:
-            pass
-
-    def _draw(self, force=False):
-        now = time.time()
-        if (
-            not force
-            and (now - self.last_draw_time) < self.refresh_interval_sec
-        ):
-            return
-        self.last_draw_time = now
-
-        hr_count = len(self.hr_points)
-        ecg_count = len(self.ecg_points)
-        self.status_text.set_text(
-            f"Last {hr_count} HR points, {ecg_count} ECG samples | "
-            f"refresh every {self.refresh_interval_sec}s"
-        )
-
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
-        self.plt.pause(0.001)
-
-    def update(self, hr_value=None, ecg_samples=None):
-        if hr_value is not None:
-            self.hr_points.append(hr_value)
-
-        if ecg_samples:
-            self.ecg_points.extend(ecg_samples)
-
-        if self.hr_points:
-            y_hr = list(self.hr_points)
-            x_hr = list(range(len(y_hr)))
-            self.hr_line.set_data(x_hr, y_hr)
-            self.ax_hr.set_xlim(0, max(10, len(y_hr)))
-            hr_min = min(y_hr)
-            hr_max = max(y_hr)
-            if hr_min == hr_max:
-                hr_min -= 1
-                hr_max += 1
-            self.ax_hr.set_ylim(hr_min - 2, hr_max + 2)
-
-        if self.ecg_points:
-            y_ecg = list(self.ecg_points)
-            x_ecg = list(range(len(y_ecg)))
-            self.ecg_line.set_data(x_ecg, y_ecg)
-            self.ax_ecg.set_xlim(0, max(200, len(y_ecg)))
-            ecg_min = min(y_ecg)
-            ecg_max = max(y_ecg)
-            if ecg_min == ecg_max:
-                ecg_min -= 1
-                ecg_max += 1
-            margin = max(2, int((ecg_max - ecg_min) * 0.1))
-            self.ax_ecg.set_ylim(ecg_min - margin, ecg_max + margin)
-
-        self._draw(force=False)
-
-    def close(self):
-        self.plt.ioff()
-        self.plt.close(self.fig)
-
+from live_monitor_plot import LiveMonitorPlot  # noqa: F401
 
 def extract_first_hr_and_ecg(record_data):
     """Extract first HR-like trend value and first ECG-like wave samples."""
@@ -697,15 +493,15 @@ def run_terminal_simulator(
     use_rtscts=True,
     alarm_start_frames=None,
     alarm_stop_frames=None,
+    trend_interval_sec=10,
 ):
     """Run headless collection, print to terminal, and optionally save DRC file."""
-    print(f"Running for {duration_sec} seconds...\n")
+    print(f"Running for {duration_sec} seconds, trend interval={trend_interval_sec}s...\n")
 
-    start_param_command = stripspaces(
-        "7E31 0000 00E8 FD25 0407 6700 0000 0000 0000 0000 "
-        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
-        "0001 0A00 0800 0000 0000 BF7E"
-    )
+    from collector_worker import CollectorWorker
+    start_param_command = CollectorWorker._build_start_param_frame(
+        trend_interval_sec
+    ).hex()
     start_waves_command = stripspaces(
         "7E58 0000 00E8 FD58 2708 6700 0000 0001 0000 0000 "
         "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000 "
@@ -733,6 +529,7 @@ def run_terminal_simulator(
     trend_record_count = 0
     waveform_record_count = 0
     alarm_record_count = 0
+    last_trend_time = None
     try:
         ser = serial.Serial(
             port=port,
@@ -779,6 +576,15 @@ def run_terminal_simulator(
                         monitor_last_unix = r_time
                         if r_maintype == 0:
                             trend_record_count += 1
+                            delta = 0
+                            if last_trend_time is not None:
+                                delta = r_time - last_trend_time
+                            last_trend_time = r_time
+                            print(
+                                f"  >> TREND #{trend_record_count}"
+                                f" time={r_time}"
+                                f" delta={delta:+d}s"
+                            )
                         elif r_maintype == 1:
                             waveform_record_count += 1
                         elif r_maintype == 4:
@@ -962,6 +768,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--trend-interval",
+        type=int,
+        default=10,
+        help="Trend data interval in seconds (5-120, default 10).",
+    )
+    parser.add_argument(
         "--config",
         default="config/pycollect_gui_config.json",
         help="Path to JSON config file (for --terminal-simulator mode).",
@@ -1055,6 +867,7 @@ def main():
         print(f"Terminal simulator mode on {args.port}")
         if wave_defs:
             print(f"Loaded {len(wave_defs)} waveform definitions from config")
+        cli_trend_interval = max(5, min(120, args.trend_interval))
         run_terminal_simulator(
             port=args.port,
             duration_sec=args.duration if args.duration > 0 else 60,
@@ -1064,6 +877,7 @@ def main():
             use_rtscts=cli_use_rtscts,
             alarm_start_frames=alarm_start_frames,
             alarm_stop_frames=alarm_stop_frames,
+            trend_interval_sec=cli_trend_interval,
         )
         return
 

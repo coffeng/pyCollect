@@ -63,19 +63,17 @@ def test_connection(win: gui.PyCollectQtWindow) -> None:
         win.conn_section.toggle_btn.isChecked(),
         "starts expanded",
     )
-    # Toggle collapse / expand via click
-    win.conn_section.toggle_btn.click()
-    QtWidgets.QApplication.processEvents()
-    _expect(
-        not win.conn_section.content.isVisible(),
-        "collapses on click",
-    )
-    win.conn_section.toggle_btn.click()
-    QtWidgets.QApplication.processEvents()
-    _expect(
-        win.conn_section.content.isVisible(),
-        "expands on click",
-    )
+    # Connection is now embedded in CAPTURE tab (stub section),
+    # so collapse/expand is a no-op — verify it doesn't crash.
+    try:
+        win.conn_section.toggle_btn.click()
+        QtWidgets.QApplication.processEvents()
+        win.conn_section.toggle_btn.click()
+        QtWidgets.QApplication.processEvents()
+        ok = True
+    except Exception:
+        ok = False
+    _expect(ok, "toggle click on conn_section stub is safe")
     # Refresh ports button is wired and populates combo without error
     before = win.port_combo.count()
     win.refresh_ports_btn.click()
@@ -111,28 +109,27 @@ def test_display_windows(win: gui.PyCollectQtWindow) -> None:
 
 def test_capture(win: gui.PyCollectQtWindow) -> None:
     print("[3] Capture section")
-    _expect(win.start_btn.isEnabled(), "start enabled initially")
-    _expect(not win.stop_btn.isEnabled(), "stop disabled initially")
+    _expect(win.capture_toggle_btn.isEnabled(), "capture toggle enabled initially")
     # Click start with no port selected -> should log warning, not crash.
     win.port_combo.setCurrentIndex(-1)
     win.port_combo.clearEditText()
-    win.start_btn.click()
+    win.capture_toggle_btn.click()
     QtWidgets.QApplication.processEvents()
     text = win.status_box.toPlainText()
     _expect(
-        "No COM port" in text,
-        "start with empty port logs 'No COM port'",
+        "No COM port" in text or "no port" in text.lower(),
+        "start with empty port logs a port warning",
     )
-    _expect(win.start_btn.isEnabled(), "start still enabled after warning")
-    # Stop click while idle: safe no-op.
+    _expect(win.capture_toggle_btn.isEnabled(), "capture toggle still enabled after warning")
+    # Second click while idle: safe no-op.
     try:
-        win.stop_btn.click()
+        win.capture_toggle_btn.click()
         QtWidgets.QApplication.processEvents()
         ok = True
     except Exception as exc:
         ok = False
         print(f"    exception: {exc}")
-    _expect(ok, "stop click while idle is safe")
+    _expect(ok, "capture toggle click while idle is safe")
 
 
 def test_signal_selection(win: gui.PyCollectQtWindow) -> None:

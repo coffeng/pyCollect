@@ -315,10 +315,14 @@ def _iter_frames_from_bytes(buffer: bytearray):
 
 
 class WaveRequestState:
+    TREND_INTERVAL_OFFSET = 41  # byte offset of trend interval in decoded START_PARAM record
+
     def __init__(self):
         self.active = True
         self.selected_types = set()
         self._rx_buffer = bytearray()
+        self.trend_interval_sec = None
+        self._last_trend_time = None
 
     @staticmethod
     def _wave_types_from_request(payload: bytes):
@@ -366,12 +370,37 @@ class WaveRequestState:
         self.active = True
         self.selected_types = set(wave_types)
 
+    def _apply_param_request_record(self, record: bytes):
+        """Extract trend interval from a START_PARAM command record."""
+        if len(record) < self.TREND_INTERVAL_OFFSET + 1:
+            return
+        interval = record[self.TREND_INTERVAL_OFFSET]
+        if 1 <= interval <= 120:
+            if self.trend_interval_sec != interval:
+                print(f"Trend interval set to {interval}s (from START_PARAM)")
+            self.trend_interval_sec = interval
+            self._last_trend_time = None
+
+    def should_send_trend(self, rec_time: float) -> bool:
+        """Return True if this trend record should be sent based on interval."""
+        if self.trend_interval_sec is None:
+            return True
+        if self._last_trend_time is None:
+            self._last_trend_time = rec_time
+            return True
+        elapsed = rec_time - self._last_trend_time
+        if elapsed >= self.trend_interval_sec:
+            self._last_trend_time = rec_time
+            return True
+        return False
+
     def process_incoming_bytes(self, data: bytes):
         if not data:
             return
         self._rx_buffer.extend(data)
         for record in _iter_frames_from_bytes(self._rx_buffer):
             self._apply_wave_request_record(record)
+            self._apply_param_request_record(record)
 
 
 def _filter_wave_record(record: bytes, requested_types: set):
@@ -521,6 +550,12 @@ def replay_once(
             break
         if not simulation_mode:
             poll_wave_requests(ser, wave_state)
+        elif wave_state is not None:
+            # Non-blocking poll for trend interval commands in simulation mode
+            old_timeout = ser.timeout
+            ser.timeout = 0
+            poll_wave_requests(ser, wave_state)
+            ser.timeout = old_timeout
 
         if speed_ctrl.refresh():
             print(
@@ -547,6 +582,13 @@ def replay_once(
         if filtered is None:
             prev_time = rec_time
             continue
+
+        # Apply trend interval filtering
+        if wave_state is not None and len(filtered) >= 40:
+            r_maintype = struct.unpack_from("<h", filtered, 14)[0]
+            if r_maintype == 0 and not wave_state.should_send_trend(rec_time):
+                prev_time = rec_time
+                continue
 
         frame = frame_record(filtered)
         ser.write(frame)
