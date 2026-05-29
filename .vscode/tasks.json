@@ -2,11 +2,139 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "Build: EXEs (PyInstaller)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "${workspaceFolder}\\build.py",
+        "--no-sign",
+        "--no-installer"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Build: Sign EXEs",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\sign.ps1",
+        "-Target",
+        "exes"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": false
+      },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Build: Installer (Inno Setup)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\build_installer.ps1"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": false
+      },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Build: Sign Installer",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\sign.ps1",
+        "-Target",
+        "installer"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": false
+      },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Build: Full (EXEs → Sign EXEs → Installer → Sign Installer)",
+      "dependsOn": [
+        "Build: EXEs (PyInstaller)",
+        "Build: Sign EXEs",
+        "Build: Installer (Inno Setup)",
+        "Build: Sign Installer"
+      ],
+      "dependsOrder": "sequence",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
       "label": "Run GUI (Simulation Mode)",
       "type": "shell",
-      "command": ".\\run_pycollect.bat",
+      "command": "powershell",
       "args": [
-        "3"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\run_option3.ps1",
+        "-PythonExe",
+        "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+        "-Root",
+        "${workspaceFolder}",
+        "-Drc",
+        "C:\\Users\\100014430\\Box\\iCollect 5.x\\Data\\Parameter_Files\\C.O\\case001-083_primaari_1.drc",
+        "-SimPort",
+        "COM4",
+        "-GuiPort",
+        "COM2",
+        "-SimCtrlPort",
+        "9031",
+        "-GuiCtrlPort",
+        "9032"
       ],
       "options": {
         "cwd": "${workspaceFolder}"

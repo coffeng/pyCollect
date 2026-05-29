@@ -2,6 +2,27 @@
 
 This document started as a plan and now also tracks implemented/tested status for the current prototype.
 
+## Important: Default Configuration Sync
+
+**For maintainers:** The default configuration file deployed with the installer 
+(`config/pycollect_gui_config.default.json`) defines the initial UI state and signal 
+definitions for first-time users. When modifying the GUI code to add, remove, or rename 
+UI configuration fields (in the `ui` section), you **must update both**:
+
+1. **Code (`code/pycollect_qt_gui.py`)**: The field names expected during initialization
+2. **Default config (`config/pycollect_gui_config.default.json`)**: All new/changed fields with sensible defaults
+
+Critical fields that must stay in sync:
+- `ui.output_directory`, `ui.output_filename`
+- `ui.review_file`, `ui.last_active_drc_file`  
+- `ui.duration_sec`, `ui.trend_window_sec`, `ui.wave_window_sec`, `ui.trend_interval_sec`
+- `ui.connection.baudrate`, `ui.simulator.speed_multiplier`
+- `ui.graph_split_ratio`, `ui.locked_sections`
+
+If fields diverge, fresh installations may fail to load or display correctly on first launch.
+(This requirement does not apply to the user's runtime config in `AppData\Local\pyCollect`—that 
+auto-migrates on load.)
+
 ## Update: 2026-05-27
 
 Configuration and packaging were updated for current simulation/review workflows.
@@ -17,6 +38,8 @@ Configuration and packaging were updated for current simulation/review workflows
   using configured simulation speed (no hardcoded max-speed override).
 - Confirmed active runtime config path on Windows remains:
   `C:\Users\100014430\AppData\Local\pyCollect\pycollect_gui_config.json`.
+- Default configuration now initializes to `Example.drc` for immediate review on first launch.
+- Example files (`Example.drc`, `Example.txt`) included in setup installer for first-time users.
 
 ### Windows EXE + Setup Build
 
@@ -25,6 +48,19 @@ Primary build entry point:
 ```powershell
 .\.venv\Scripts\python.exe .\build.py --no-sign
 ```
+
+VS Code task pipeline (recommended on Windows):
+
+- `Build: EXEs (PyInstaller)`
+- `Build: Sign EXEs`
+- `Build: Installer (Inno Setup)`
+- `Build: Sign Installer`
+- `Build: Full (EXEs -> Sign EXEs -> Installer -> Sign Installer)`
+
+Task helper scripts:
+
+- `sign.ps1` signs `dist\pyCollect.exe`, `dist\pyCollect-cli.exe`, and installer output.
+- `build_installer.ps1` compiles `pyCollect.iss` and writes installer artifacts to `dist\installer`.
 
 Build script behavior:
 
@@ -38,13 +74,18 @@ Expected outputs:
 
 - `dist\pyCollect.exe`
 - `dist\pyCollect-cli.exe`
-- `pyCollect_Setup.exe`
+- `dist\installer\pyCollect_Setup.exe`
 
 Useful flags:
 
 - `--no-sign` : skips signtool prompt.
 - `--no-installer` : build exe only.
 - `--version X.Y.Z` : explicit version override.
+
+Signing prerequisites:
+
+- `signtool.exe` available via PATH or Windows SDK installation.
+- A valid code-signing certificate available for selection (or adjust `sign.ps1` for thumbprint/PFX).
 
 ### GUI vs CLI on Windows
 
