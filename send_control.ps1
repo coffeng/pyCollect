@@ -4,7 +4,7 @@ param(
     [string]$Target = 'gui',
 
     [Parameter(Mandatory=$false)]
-    [ValidateSet('ping','status','stop','help')]
+    [ValidateSet('ping','status','stop','start','help')]
     [string]$Command = 'status',
 
     [Parameter(Mandatory=$false)]

@@ -1,0 +1,31 @@
+PyCollect Example Data File
+=============================
+
+This file accompanies Example.drc, a sample DRC (Device Record Collection) file 
+included with the pyCollect distribution.
+
+File: Example.drc
+- Contains sample waveform and trend data from a bedside patient monitor
+- Includes ECG, pressures, SpO2, respiratory, and anesthetic gas channels
+- Open in pyCollect by selecting File > Review DRC File, or the application
+  will load this example automatically on first launch for review
+
+Using the Example
+-----------------
+1. Launch pyCollect after installation
+2. The application will automatically open Example.drc in Review mode
+3. Browse the waveforms and trends using the sidebar
+4. Toggle between trend and waveform views using the "Trends" and "Waves" buttons
+5. Zoom and pan plots using mouse wheel and drag operations
+6. Exit Review mode by clicking "Exit Review" to return to Capture setup
+
+To Use Your Own Data
+---------------------
+- Click "File" > "Select DRC File" to load your own DRC records
+- Configure capture settings: COM port, output filename, duration, signal selection
+- Click "Record" to start capturing patient data
+- Saved DRC files can be reopened for review at any time
+
+Documentation
+--------------
+For complete usage instructions, see README.md in the pyCollect installation directory.

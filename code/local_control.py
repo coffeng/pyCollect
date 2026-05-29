@@ -12,12 +12,14 @@ class LocalControlServer:
         port: int,
         on_stop: Optional[Callable[[], str]] = None,
         on_status: Optional[Callable[[], str]] = None,
+        on_start: Optional[Callable[[], str]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ):
         self.name = name
         self.port = int(port or 0)
         self.on_stop = on_stop
         self.on_status = on_status
+        self.on_start = on_start
         self.logger = logger or (lambda _msg: None)
         self._thread = None
         self._stop_event = threading.Event()
@@ -44,10 +46,30 @@ class LocalControlServer:
             self._thread.join(timeout=1.0)
             self._thread = None
 
+    @staticmethod
+    def send_command(port: int, command: str, timeout: float = 0.1) -> Optional[str]:
+        """Send a command to a control server and return the response."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(("127.0.0.1", port))
+            sock.sendall(command.encode("utf-8"))
+            data = sock.recv(4096)
+            sock.close()
+            return data.decode("utf-8", errors="ignore").strip()
+        except (OSError, ConnectionError, socket.timeout):
+            return None
+
+    @staticmethod
+    def is_peer_listening(port: int) -> bool:
+        """Check if a control server is listening on the given port."""
+        resp = LocalControlServer.send_command(port, "ping")
+        return resp is not None and resp.startswith("pong")
+
     def _handle_command(self, command: str) -> str:
         cmd = (command or "").strip().lower()
         if cmd in ("", "help"):
-            return "commands: ping, status, stop"
+            return "commands: ping, status, stop, start"
         if cmd == "ping":
             return f"pong {self.name}"
         if cmd == "status":
@@ -64,6 +86,13 @@ class LocalControlServer:
                 return str(self.on_stop())
             except Exception as exc:
                 return f"stop_error: {exc}"
+        if cmd == "start":
+            if self.on_start is None:
+                return "start not supported"
+            try:
+                return str(self.on_start())
+            except Exception as exc:
+                return f"start_error: {exc}"
         return f"unknown command: {command}"
 
     def _run(self):

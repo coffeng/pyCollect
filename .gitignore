@@ -8,3 +8,11 @@ output/*
 __pycache__/
 .venv/
 drc_2_csv_*.log
+
+# Build artifacts
+build/
+dist/
+*.exe
+
+# Installer/test logs
+installer_*.log

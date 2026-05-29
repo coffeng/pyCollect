@@ -19,18 +19,21 @@ Name: "{app}\config"
 [Files]
 Source: "dist\pyCollect.exe"; DestDir: "{app}"
 Source: "dist\pyCollect-cli.exe"; DestDir: "{app}"
-Source: "README.md"; DestDir: "{app}"
+Source: "pyCollect.pdf"; DestDir: "{app}"
 Source: "assets\icon.ico"; DestDir: "{app}"
-Source: "config\pycollect_gui_config.json"; DestDir: "{app}\config"
+Source: "config\pycollect_gui_config.default.json"; DestDir: "{app}\config"
 Source: "config\params5.txt"; DestDir: "{app}\config"
 Source: "config\waves5.txt"; DestDir: "{app}\config"
-Source: "config\pycollect_gui_config.json"; DestDir: "{localappdata}\pyCollect"; Flags: onlyifdoesntexist
+Source: "Example.drc"; DestDir: "{app}"
+Source: "Example.txt"; DestDir: "{app}"
+Source: "config\pycollect_gui_config.default.json"; DestDir: "{localappdata}\pyCollect"; DestName: "pycollect_gui_config.json"; Flags: onlyifdoesntexist
 Source: "config\params5.txt"; DestDir: "{localappdata}\pyCollect"; Flags: onlyifdoesntexist
 Source: "config\waves5.txt"; DestDir: "{localappdata}\pyCollect"; Flags: onlyifdoesntexist
+Source: "Example.drc"; DestDir: "{localappdata}\pyCollect"; Flags: onlyifdoesntexist
 
 [Icons]
-Name: "{commonprograms}\pyCollect"; Filename: "{app}\pyCollect.exe"; IconFilename: "{app}\icon.ico"
-Name: "{commondesktop}\pyCollect"; Filename: "{app}\pyCollect.exe"; IconFilename: "{app}\icon.ico"
+Name: "{userprograms}\pyCollect"; Filename: "{app}\pyCollect.exe"; IconFilename: "{app}\icon.ico"
+Name: "{userdesktop}\pyCollect"; Filename: "{app}\pyCollect.exe"; IconFilename: "{app}\icon.ico"
 
 [Run]
 Filename: "{app}\pyCollect.exe"; Description: "{cm:LaunchProgram,pyCollect}"; Flags: nowait postinstall

@@ -211,23 +211,19 @@
     "trend_window_sec": 60,
     "wave_window_sec": 30.0,
     "trend_interval_sec": 120,
-    "section_locks": {
-      "monitor_connection": false,
-      "session_setup": false,
-      "monitoring_control": false
-    },
+    "section_locks": {},
     "connection": {
       "baudrate": 19200
     },
     "simulator": {
-      "speed_multiplier": 20.0
+      "speed_multiplier": 1.0
     },
-    "graph_split_ratio": 0.5084925690021231,
+    "graph_split_ratio": 0.5,
     "locked_sections": [],
-    "output_directory": "C:\\Users\\100014430\\Documents\\GitHub\\Enterprise\\pyCollect\\config\\output",
+    "output_directory": "",
     "output_filename": "record.drc",
-    "review_file": "C:\\Users\\100014430\\Documents\\GitHub\\Enterprise\\pyCollect\\output\\record.drc",
-    "last_active_drc_file": "C:\\Users\\100014430\\Documents\\GitHub\\Enterprise\\pyCollect\\output\\record.drc"
+    "review_file": "Example.drc",
+    "last_active_drc_file": "Example.drc"
   },
   "channels": {
     "trends": [

@@ -11,7 +11,7 @@ import time
 import textwrap
 import traceback
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pyqtgraph as pg
@@ -22,6 +22,288 @@ from serial.tools import list_ports
 import drc_2_csv
 from local_control import LocalControlServer
 import pycollect
+
+
+# === Port Scan Worker Thread ===
+class PortScanWorker(QtCore.QThread):
+    """Background port scanner thread that emits results via signals."""
+    results_signal = QtCore.pyqtSignal(dict)  # Emits {port_baud_combo: (port, baud), success_pairs: [(port, baud), ...], tooltip_text: str}
+    finished_signal = QtCore.pyqtSignal()
+    error_signal = QtCore.pyqtSignal(str)
+
+    # S/5 DRI protocol constants
+    FLAG = 0x7E
+    ESCAPE = 0x7D
+    ESCAPE_MOD = 0x20
+    HEADER_FMT = "< h b b H I b b H h " + "h b" * 8
+    HEADER_SIZE = struct.calcsize(HEADER_FMT)
+    FAST_PRETEST_TIMEOUT_S = 0.18
+
+    ONE_SHOT_TREND_REQUEST = bytes.fromhex(
+        "7E"
+        "3100000000000000000000000000000000000000000000"
+        "FF00000000000000000000000000000000000000"
+        "01FFFF080000000037"
+        "7E"
+    )
+    PERIODIC_TREND_REQUEST = bytes.fromhex(
+        "7E31 0000 00E8 FD25 0407 6700 0000 0000 0000 0000"
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000"
+        "0001 0A00 0800 0000 0000 BF7E".replace(" ", "")
+    )
+    STOP_TREND_REQUEST = bytes.fromhex(
+        "7E31 0000 00E8 FD33 0607 6700 0000 0000 0000 0000"
+        "0000 FF00 0000 0000 0000 0000 0000 0000 0000 0000"
+        "0001 0000 0800 0000 0000 C57E".replace(" ", "")
+    )
+    BAUDS = [19200, 115200]
+    MAINTYPE_NAMES = {0: "PHDB (trend)", 1: "WAVE", 4: "ALARM"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop_requested = False
+
+    def run(self):
+        """Execute port scan in background thread."""
+        try:
+            now_local = datetime.now().astimezone()
+            utc_offset = now_local.utcoffset() or timedelta(0)
+            utc_offset_sec = int(utc_offset.total_seconds())
+
+            # Enumerate ports in descending order (latest USB first)
+            seen = set()
+            ports = []
+            for p in sorted(
+                list_ports.comports(),
+                key=lambda x: (
+                    int(x.device[3:])
+                    if x.device.upper().startswith("COM") and x.device[3:].isdigit()
+                    else -1,
+                    x.device,
+                ),
+                reverse=True,
+            ):
+                if p.device not in seen:
+                    seen.add(p.device)
+                    ports.append(p.device)
+
+            if not ports:
+                self.results_signal.emit({
+                    "success_pairs": [],
+                    "tooltip_text": "No COM ports found."
+                })
+                self.finished_signal.emit()
+                return
+
+            success_pairs = []
+            tooltip_lines = [f"Port Scan Results:"]
+            tooltip_lines.append(f"Windows UTC offset: {self._format_offset(utc_offset_sec)}")
+            tooltip_lines.append("")
+
+            # Measure baseline timeout from COM5@19200 if available
+            baseline_timeout = 5.0
+            baseline_pair = ("COM5", 19200)
+
+            if baseline_pair[0] in ports and not self._stop_requested:
+                t0 = time.time()
+                rec, mode = self._probe_port(
+                    baseline_pair[0],
+                    baseline_pair[1],
+                    one_shot_timeout_s=4.0,
+                    periodic_timeout_s=12.0,
+                )
+                t1 = time.time()
+                if rec is not None:
+                    elapsed = t1 - t0
+                    baseline_timeout = elapsed + 1.0
+                    success_pairs.append(baseline_pair)
+                    tooltip_lines.append(f"✓ {baseline_pair[0]} @ {baseline_pair[1]}: {elapsed:.2f}s (baseline)")
+
+            # Scan all port/baud combinations
+            for port in ports:
+                if self._stop_requested:
+                    break
+                for baud in self.BAUDS:
+                    if self._stop_requested:
+                        break
+                    if (port, baud) == baseline_pair:
+                        continue  # Already scanned
+
+                    # Fast pretest
+                    is_candidate, pre_elapsed = self._pretest_port(port, baud)
+                    if not is_candidate:
+                        continue
+
+                    # Full probe with timeout strategy
+                    one_shot_timeout = min(2.0, baseline_timeout)
+                    periodic_timeout = max(0.5, baseline_timeout - one_shot_timeout)
+                    pc_before = time.time()
+                    rec, mode = self._probe_port(
+                        port,
+                        baud,
+                        one_shot_timeout_s=one_shot_timeout,
+                        periodic_timeout_s=periodic_timeout,
+                    )
+                    pc_after = time.time()
+                    elapsed = pc_after - pc_before
+
+                    if rec is not None:
+                        success_pairs.append((port, baud))
+                        tooltip_lines.append(f"✓ {port} @ {baud}: {elapsed:.2f}s ({mode})")
+
+            if not success_pairs:
+                tooltip_lines.append("No S/5 monitors detected.")
+
+            self.results_signal.emit({
+                "success_pairs": success_pairs,
+                "tooltip_text": "\n".join(tooltip_lines)
+            })
+        except Exception as e:
+            self.error_signal.emit(f"Port scan error: {str(e)}")
+        finally:
+            self.finished_signal.emit()
+
+    def _unescape(self, data: bytes) -> bytearray:
+        """Unescape S/5 DRI byte-stuffed data."""
+        out = bytearray()
+        it = iter(data)
+        for b in it:
+            if b == self.ESCAPE:
+                nb = next(it, None)
+                if nb is not None:
+                    out.append(nb ^ self.ESCAPE_MOD)
+            else:
+                out.append(b)
+        if len(out) > self.HEADER_SIZE:
+            if out[0] == self.FLAG:
+                out = out[1:]
+            if out[-1] == self.FLAG:
+                out = out[:-1]
+            out = out[:-1]
+        return out
+
+    def _parse_header(self, record: bytes):
+        """Parse S/5 DRI header."""
+        if len(record) < self.HEADER_SIZE:
+            return None
+        hdr = struct.unpack(self.HEADER_FMT, record[:self.HEADER_SIZE])
+        return {
+            "r_len": int(hdr[0]),
+            "r_time": int(hdr[4]),
+            "r_type": int(hdr[5]),
+            "r_maintype": int(hdr[8]),
+        }
+
+    def _pretest_port(self, port: str, baud: int, timeout_s: float = None):
+        """Fast activity pretest (~180ms).
+        Returns (is_candidate: bool, elapsed: float).
+        """
+        if timeout_s is None:
+            timeout_s = self.FAST_PRETEST_TIMEOUT_S
+        t0 = time.time()
+        try:
+            ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                timeout=0.03,
+                write_timeout=0.2,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_EVEN,
+                stopbits=serial.STOPBITS_ONE,
+                rtscts=True,
+            )
+        except (serial.SerialException, OSError):
+            return False, (time.time() - t0)
+
+        try:
+            ser.reset_input_buffer()
+            ser.write(self.ONE_SHOT_TREND_REQUEST)
+            t_end = time.monotonic() + float(max(0.05, timeout_s))
+            while time.monotonic() < t_end:
+                chunk = ser.read(min(256, max(1, ser.in_waiting or 1)))
+                if chunk:
+                    return True, (time.time() - t0)
+            return False, (time.time() - t0)
+        except (serial.SerialException, OSError):
+            return False, (time.time() - t0)
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _probe_port(self, port: str, baud: int, one_shot_timeout_s: float, periodic_timeout_s: float):
+        """Full protocol probe. Returns (record_bytes, mode_label) or (None, None)."""
+        ser_timeout = 0.1
+        try:
+            ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                timeout=ser_timeout,
+                write_timeout=0.5,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_EVEN,
+                stopbits=serial.STOPBITS_ONE,
+                rtscts=True,
+            )
+        except (serial.SerialException, OSError):
+            return None, None
+
+        try:
+            for frame, mode_label, mode_timeout in (
+                (self.ONE_SHOT_TREND_REQUEST, "one-shot", one_shot_timeout_s),
+                (self.PERIODIC_TREND_REQUEST, "periodic-10s", periodic_timeout_s),
+            ):
+                ser.reset_input_buffer()
+                ser.write(frame)
+                t_end = time.monotonic() + float(max(0.2, mode_timeout))
+
+                while time.monotonic() < t_end:
+                    incoming_data = ser.read_until(bytes([self.FLAG]))
+                    if len(incoming_data) < self.HEADER_SIZE:
+                        incoming_data = ser.read_until(bytes([self.FLAG]))
+
+                    record = self._unescape(incoming_data)
+                    if len(record) < self.HEADER_SIZE:
+                        continue
+
+                    hdr = self._parse_header(bytes(record))
+                    if hdr is None:
+                        continue
+                    if hdr["r_maintype"] != 0:
+                        continue
+
+                    try:
+                        ser.write(self.STOP_TREND_REQUEST)
+                    except Exception:
+                        pass
+                    return bytes(record), mode_label
+
+                try:
+                    ser.write(self.STOP_TREND_REQUEST)
+                except Exception:
+                    pass
+
+            return None, None
+        except (serial.SerialException, OSError):
+            return None, None
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _format_offset(self, offset_sec: int) -> str:
+        """Format UTC offset for display."""
+        sign = "+" if offset_sec >= 0 else "-"
+        abs_sec = abs(offset_sec)
+        hh = abs_sec // 3600
+        mm = (abs_sec % 3600) // 60
+        return f"{sign}{hh:02d}:{mm:02d}"
+
+    def request_stop(self):
+        """Request the thread to stop gracefully."""
+        self._stop_requested = True
 
 
 START_PARAM_HEX = (
@@ -315,10 +597,6 @@ def load_signal_config(config_path=None):
         raise SignalConfigError(
             "JSON must declare at least 1 trend row identifier"
         )
-    if len(wave_select) == 0:
-        raise SignalConfigError(
-            "JSON must declare at least 1 waveform row identifier"
-        )
 
     all_trend_defs = []
     for row_id, row in enumerate(params_rows, start=1):
@@ -400,6 +678,12 @@ def load_signal_config(config_path=None):
     initial_output_filename = str(
         ui_cfg.get("output_filename", "")
     ).strip()
+    initial_review_file = str(
+        ui_cfg.get("review_file", "")
+    ).strip()
+    initial_last_active_drc_file = str(
+        ui_cfg.get("last_active_drc_file", "")
+    ).strip()
     initial_duration = int(ui_cfg.get("duration_sec", 60))
     initial_trend_window = float(ui_cfg.get("trend_window_sec", 60))
     initial_wave_window = float(ui_cfg.get("wave_window_sec", 10))
@@ -427,6 +711,8 @@ def load_signal_config(config_path=None):
         "initial_baudrate": initial_baudrate,
         "initial_output_directory": initial_output_directory,
         "initial_output_filename": initial_output_filename,
+        "initial_review_file": initial_review_file,
+        "initial_last_active_drc_file": initial_last_active_drc_file,
         "initial_sim_speed": max(
             0.05,
             min(1000.0, initial_sim_speed),
@@ -1131,6 +1417,7 @@ class CollectorWorker(QtCore.QThread):
         alarm_record_count = 0
         logical_time_sec = 0.0
         package_counter = 0
+        wave_requests_enabled = False
         try:
             output_file = pycollect.build_output_filename(self.output_name)
             resolved_output = pycollect.resolve_non_overwriting_path(output_file)
@@ -1167,10 +1454,12 @@ class CollectorWorker(QtCore.QThread):
                     f"Alarm request sent ({len(alarm_start_frames)} frame(s))"
                 )
             initial_rows = self._consume_wave_request_rows(force=True) or []
-            self._send(
-                ser,
-                self._build_wave_request_frame(initial_rows),
-            )
+            if initial_rows:
+                self._send(
+                    ser,
+                    self._build_wave_request_frame(initial_rows),
+                )
+                wave_requests_enabled = True
             self.status_signal.emit("Capture started")
 
             while package_counter < self.duration_sec:
@@ -1180,14 +1469,20 @@ class CollectorWorker(QtCore.QThread):
 
                 pending_rows = self._consume_wave_request_rows(force=False)
                 if pending_rows is not None:
-                    self._send(
-                        ser,
-                        self._build_wave_request_frame(pending_rows),
-                    )
-                    self.status_signal.emit(
-                        "Wave request updated: "
-                        + ",".join(str(v) for v in pending_rows)
-                    )
+                    if pending_rows:
+                        self._send(
+                            ser,
+                            self._build_wave_request_frame(pending_rows),
+                        )
+                        wave_requests_enabled = True
+                        self.status_signal.emit(
+                            "Wave request updated: "
+                            + ",".join(str(v) for v in pending_rows)
+                        )
+                    elif wave_requests_enabled:
+                        self._send(ser, STOP_WAVES_HEX)
+                        wave_requests_enabled = False
+                        self.status_signal.emit("Wave request updated: none")
 
                 incoming_data = ser.read_until(bytes([pycollect.FLAG_CHAR]))
                 if len(incoming_data) < 40:
@@ -1242,7 +1537,8 @@ class CollectorWorker(QtCore.QThread):
                 alarm_stop_frames = [self.alarm_stop_hex]
             for frame in alarm_stop_frames:
                 self._send(ser, frame)
-            self._send(ser, STOP_WAVES_HEX)
+            if wave_requests_enabled:
+                self._send(ser, STOP_WAVES_HEX)
             self.status_signal.emit("Stop commands sent")
 
             self.finished_signal.emit(output_file)
@@ -1398,6 +1694,10 @@ class CsvConversionWorker(QtCore.QThread):
             self.error_signal.emit(str(exc))
 
 
+# ---------------------------------------------------------------------------
+
+
+
 class PyCollectQtWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
@@ -1410,8 +1710,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         debug_stdout=False,
         control_port=0,
         no_rtscts=False,
+        auto_open_last_review=False,
+        instance_id=1,
     ):
         super().__init__()
+        self._instance_id = instance_id
         self.setWindowTitle("pyCollect Interactive Viewer")
         self.resize(1300, 760)
 
@@ -1423,6 +1726,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.output_name = output_name
         self.output_directory = ""
         self.output_filename = ""
+        self.review_source_file = str(
+            config.get("initial_review_file", "") or ""
+        ).strip()
+        self.last_active_drc_file = str(
+            config.get("initial_last_active_drc_file", "") or ""
+        ).strip()
+        self.auto_open_last_review = bool(auto_open_last_review)
         self.autostart = autostart
         self.simulation_mode = simulation_mode
         self.debug_stdout = debug_stdout
@@ -1430,6 +1740,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.no_rtscts = bool(no_rtscts)
         self._is_closing = False
         self._allow_close_during_capture = False
+        self._peer_ports = []  # ports of other pyCollect instances
         self.trend_defs = config["trend_defs"]
         self.wave_defs = config["wave_defs"]
         self.positive_trend_rows = set()
@@ -1469,6 +1780,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.review_last_header_utc = None
         self.csv_worker = None
         self.csv_convert_in_progress = False
+        
+        # Port scan worker and results
+        self.port_scan_worker = None
+        self.port_scan_results = {"success_pairs": [], "tooltip_text": ""}
+        self.port_scan_active = False
+        
         self.invalid_detected_total = 0
         self.invalid_wave_points_total = 0
         self.invalid_trend_points_total = 0
@@ -1525,7 +1842,9 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             self.duration_spin.setValue(initial_duration)
 
         if initial_port:
-            port_index = self.port_combo.findText(initial_port)
+            port_index = self.port_combo.findData(initial_port)
+            if port_index < 0:
+                port_index = self.port_combo.findText(initial_port)
             if port_index >= 0:
                 self.port_combo.setCurrentIndex(port_index)
                 self.log(f"Preselected port from CLI: {initial_port}")
@@ -1537,6 +1856,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         if autostart and initial_port:
             QtCore.QTimer.singleShot(0, self.start_capture)
+        elif self.auto_open_last_review:
+            QtCore.QTimer.singleShot(
+                0,
+                self._auto_open_last_review_if_available,
+            )
 
         # Start the wave catalog color refresh loop now so colors update
         # before, during, and after capture (1 Hz).
@@ -1554,9 +1878,24 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             port=self.control_port,
             on_stop=self._on_control_stop,
             on_status=self._on_control_status,
+            on_start=self._on_control_start,
             logger=self.log,
         )
-        self.control_server.start()
+        if not self.control_server.start() and self.control_port > 0:
+            self.log(
+                f"Control port {self.control_port} in use "
+                "(another instance may be running)"
+            )
+        self._discover_peers()
+        self._apply_instance_appearance()
+
+    def _apply_instance_appearance(self):
+        """For secondary instances: offset window position."""
+        if self._instance_id <= 1:
+            return
+        # Offset window so both are visible simultaneously
+        geo = self.geometry()
+        self.move(geo.x() + 60, geo.y() + 60)
 
     def _default_output_directory(self):
         cfg_dir = Path(self.config.get("config_dir", "") or Path.cwd())
@@ -1603,6 +1942,37 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.output_name = str(
             Path(self.output_directory) / self.output_filename
         )
+        if not self.review_source_file:
+            self.review_source_file = self.output_name
+
+    def _active_drc_input_path(self):
+        candidates = [
+            str(self.last_active_drc_file or "").strip(),
+            str(self.review_source_file or "").strip(),
+            str(self.current_output_file or "").strip(),
+            str(self.output_name or "").strip(),
+        ]
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return ""
+
+    def _auto_open_last_review_if_available(self):
+        if self._is_capture_running() or self.review_mode:
+            return
+        review_input = self._active_drc_input_path()
+        if not review_input:
+            return
+        candidate = Path(review_input)
+        if not candidate.exists() or candidate.suffix.lower() != ".drc":
+            return
+        self.review_file_edit.setText(str(candidate))
+        self._on_review_source_edited()
+        self.log(
+            "Auto-opening last active review file: "
+            f"{candidate.name}"
+        )
+        self._on_review_clicked()
 
     def _sync_output_target_from_inputs(self):
         folder = str(self.save_folder_edit.text() or "").strip()
@@ -1613,10 +1983,6 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.output_directory = folder
         self.output_filename = filename
         self.output_name = str(Path(folder) / filename)
-        self.save_target_preview_label.setText(
-            self._wrap_sidebar_text(self.output_name)
-        )
-        self.save_target_preview_label.setToolTip(self.output_name)
 
     def _on_browse_output_folder(self):
         start_dir = str(self.save_folder_edit.text() or "").strip()
@@ -1631,9 +1997,63 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
         self.save_folder_edit.setText(selected)
 
+    def _on_browse_output_filename(self):
+        start_path = str(self.output_name or "").strip()
+        if not start_path:
+            start_path = str(
+                Path(self._default_output_directory()) / "record.drc"
+            )
+        selected, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Select recording file",
+            start_path,
+            "DRC Files (*.drc);;All Files (*)",
+        )
+        if not selected:
+            return
+        selected_path = Path(selected)
+        self.save_folder_edit.setText(str(selected_path.parent))
+        self.save_filename_edit.setText(
+            self._normalized_output_filename(selected_path.name)
+        )
+        self._on_output_target_edited()
+
+    def _sync_review_source_from_input(self):
+        self.review_source_file = str(
+            self.review_file_edit.text() or ""
+        ).strip()
+        self.review_file_edit.setToolTip(self.review_source_file)
+
+    def _on_review_source_edited(self):
+        self._sync_review_source_from_input()
+        self._save_runtime_config()
+        self._refresh_review_button_state()
+
+    def _on_browse_review_file(self):
+        start_path = str(self.review_source_file or "").strip()
+        if not start_path:
+            start_path = str(self.output_name or "").strip()
+        if not start_path:
+            start_path = self._default_output_directory()
+        selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open DRC file for review",
+            start_path,
+            "DRC Files (*.drc);;All Files (*)",
+        )
+        if not selected:
+            return
+        self.review_file_edit.setText(str(Path(selected).resolve()))
+        self._on_review_source_edited()
+        self._on_review_clicked()
+
     def _on_output_target_edited(self):
         self._sync_output_target_from_inputs()
+        if not str(self.review_file_edit.text() or "").strip():
+            self.review_file_edit.setText(self.output_name)
+            self._sync_review_source_from_input()
         self._save_runtime_config()
+        self._refresh_review_button_state()
 
     def _cfg_color(self, section, key, fallback):
         section_data = self.colors.get(section, {})
@@ -1934,7 +2354,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def _set_file_save_status(self, state, file_path=""):
         self.current_file_state = state
         self.current_output_file = str(file_path or "").strip()
-        text = "No output file"
+        text = "No active DRC file"
         if self.current_output_file:
             text = Path(self.current_output_file).name
 
@@ -1948,26 +2368,110 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             f"background:{bg};color:{fg};font-weight:600;"
         )
 
+        active_input = self._active_drc_input_path()
         can_convert = (
-            state == "green"
-            and bool(self.current_output_file)
-            and Path(self.current_output_file).exists()
+            bool(active_input)
+            and Path(active_input).exists()
             and not self.csv_convert_in_progress
         )
         self.convert_csv_btn.setVisible(
-            state == "green" or self.csv_convert_in_progress
+            can_convert or self.csv_convert_in_progress
         )
         self.convert_csv_btn.setEnabled(can_convert)
         if not self.csv_convert_in_progress:
             self._set_convert_button_progress(None)
+        self._refresh_review_button_state()
+        self._refresh_log_file_label()
 
+    def _refresh_review_button_state(self):
+        active_input = self._active_drc_input_path()
         can_review = (
-            state == "green"
-            and bool(self.current_output_file)
-            and Path(self.current_output_file).exists()
+            bool(active_input)
+            and Path(active_input).exists()
             and not self._is_capture_running()
         )
         self.review_btn.setEnabled(can_review)
+
+    def _refresh_log_file_label(self):
+        if not hasattr(self, "log_file_label"):
+            return
+        active_input = self._active_drc_input_path()
+        if active_input:
+            log_path = Path(active_input).with_suffix(".log")
+            if log_path.exists():
+                self.log_file_header.setVisible(True)
+                self.log_file_label.setVisible(True)
+                summary = self._parse_capture_log_summary(log_path)
+                self.log_file_label.setText(summary)
+                self.log_file_label.setToolTip(str(log_path))
+                return
+        self.log_file_header.setVisible(False)
+        self.log_file_label.setVisible(False)
+
+    def _parse_capture_log_summary(self, log_path):
+        """Parse .log file and return a human-readable timing summary."""
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except Exception:
+            return log_path.name
+
+        import re as _re
+        from datetime import datetime as _dt
+
+        pc_start_m = _re.search(r"pc_start=([0-9\-: ]+)", text)
+        pc_end_m = _re.search(r"pc_end=([0-9\-: ]+)", text)
+        mon_first_m = _re.search(r"monitor_first_record=(\d+)\s*\(([^)]+)\)", text)
+        mon_last_m = _re.search(r"monitor_last_record=(\d+)\s*\(([^)]+)\)", text)
+        trends_m = _re.search(r"trend_record_count=(\d+)", text)
+        waves_m = _re.search(r"waveform_record_count=(\d+)", text)
+        alarms_m = _re.search(r"alarm_record_count=(\d+)", text)
+
+        lines = []
+
+        # Duration
+        if pc_start_m and pc_end_m:
+            try:
+                t0 = _dt.strptime(pc_start_m.group(1).strip(), "%Y-%m-%d %H:%M:%S")
+                t1 = _dt.strptime(pc_end_m.group(1).strip(), "%Y-%m-%d %H:%M:%S")
+                dur = int((t1 - t0).total_seconds())
+                lines.append(f"Duration: {dur}s")
+            except Exception:
+                pass
+
+        # Clock offset at start
+        if pc_start_m and mon_first_m:
+            try:
+                pc_t = _dt.strptime(pc_start_m.group(1).strip(), "%Y-%m-%d %H:%M:%S")
+                mon_utc = _dt.strptime(mon_first_m.group(2).strip(), "%Y-%m-%d %H:%M:%S UTC")
+                offset_start = int((pc_t - mon_utc).total_seconds())
+                lines.append(f"PC\u2013Monitor offset (start): {offset_start:+d}s")
+            except Exception:
+                pass
+
+        # Clock offset at end
+        if pc_end_m and mon_last_m:
+            try:
+                pc_t = _dt.strptime(pc_end_m.group(1).strip(), "%Y-%m-%d %H:%M:%S")
+                mon_utc = _dt.strptime(mon_last_m.group(2).strip(), "%Y-%m-%d %H:%M:%S UTC")
+                offset_end = int((pc_t - mon_utc).total_seconds())
+                lines.append(f"PC\u2013Monitor offset (end): {offset_end:+d}s")
+            except Exception:
+                pass
+
+        # Record counts
+        counts = []
+        if trends_m:
+            counts.append(f"T:{trends_m.group(1)}")
+        if waves_m:
+            counts.append(f"W:{waves_m.group(1)}")
+        if alarms_m:
+            counts.append(f"A:{alarms_m.group(1)}")
+        if counts:
+            lines.append("Records: " + " ".join(counts))
+
+        if not lines:
+            return log_path.name
+        return "\n".join(lines)
 
     def _set_convert_button_progress(self, percent):
         if percent is None:
@@ -2255,13 +2759,17 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         if self._is_capture_running():
             self.log("Stop monitoring before opening review")
             return
-        if not self.current_output_file or not Path(self.current_output_file).exists():
-            self.log("No recorded DRC file available for review")
+        # Prefer the explicit review-source file over the last recorded file
+        review_input = str(self.review_source_file or "").strip()
+        if not review_input:
+            review_input = self._active_drc_input_path()
+        if not review_input or not Path(review_input).exists():
+            self.log("No DRC review file available")
             return
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            dataset = self._load_review_dataset(self.current_output_file)
+            dataset = self._load_review_dataset(review_input)
         except Exception as exc:
             self.log(f"ERROR: review load failed: {exc}")
             return
@@ -2269,7 +2777,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
 
         self.review_mode = True
-        self.review_file_path = self.current_output_file
+        self.review_file_path = review_input
         self.review_records = dataset["records"]
         self.review_trend_history_by_row = dataset["trend_history"]
         self.review_wave_history_by_id = dataset["wave_history"]
@@ -2282,9 +2790,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.review_slider.setValue(0)
         self.review_slider.blockSignals(False)
         self.review_record_index = 0
+        self.last_active_drc_file = str(self.review_file_path)
         self.log(f"Review opened: {Path(self.review_file_path).name}")
+        self._refresh_log_file_label()
         self._update_graph_header()
         self.update_plots(force=True)
+        self._update_mode_ui()
 
     def _on_review_slider_changed(self, value):
         if not self.review_mode or not self.review_records:
@@ -2319,11 +2830,12 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def convert_current_drc_to_csv(self):
         if self.csv_convert_in_progress:
             return
-        if not self.current_output_file:
+        active_input = self._active_drc_input_path()
+        if not active_input:
             self.log("No DRC file available for conversion")
             return
 
-        drc_path = Path(self.current_output_file)
+        drc_path = Path(active_input)
         if not drc_path.exists():
             self.log(f"DRC file not found: {drc_path}")
             return
@@ -2460,38 +2972,28 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         layout.setSpacing(10)
 
         self.sidebar = QtWidgets.QScrollArea()
-        self.sidebar.setMinimumWidth(330)
-        self.sidebar.setMaximumWidth(380)
+        self.sidebar.setFixedWidth(340)
         self.sidebar.setWidgetResizable(True)
         self.sidebar.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.sidebar.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.sidebar.setFrameShape(QtWidgets.QFrame.StyledPanel)
 
         self.sidebar_content = QtWidgets.QWidget()
+        self.sidebar_content.setMaximumWidth(340)
         left = QtWidgets.QVBoxLayout(self.sidebar_content)
-        left.setContentsMargins(10, 10, 10, 10)
+        left.setContentsMargins(6, 8, 6, 8)
         left.setSpacing(8)
 
         title = QtWidgets.QLabel("Bedside Monitor Workflow")
         title.setStyleSheet(
-            "font-size: 18px; font-weight: 600;"
+            "font-size: 16px; font-weight: 600;"
             f"color:{self._cfg_color('text', 'accent', '#111111')};"
         )
         left.addWidget(title)
 
-        control_row = QtWidgets.QHBoxLayout()
-        control_row.setContentsMargins(0, 0, 0, 0)
-        control_row.setSpacing(6)
-        self.capture_toggle_btn = QtWidgets.QPushButton("START")
-        self.capture_toggle_btn.setMinimumHeight(34)
-        self.capture_toggle_btn.setAutoDefault(True)
-        self.capture_toggle_btn.setDefault(False)
-        self.review_btn = QtWidgets.QPushButton("REVIEW")
-        self.review_btn.setMinimumHeight(34)
-        self.review_btn.setEnabled(False)
-        control_row.addWidget(self.capture_toggle_btn, 1)
-        control_row.addWidget(self.review_btn, 1)
-        left.addLayout(control_row)
+        # Hidden mode badge (used by _update_mode_ui for state tracking)
+        self.mode_badge_label = QtWidgets.QLabel("Mode: Capture Setup")
+        self.mode_badge_label.setVisible(False)
 
         def _hint(text):
             label = QtWidgets.QLabel(text)
@@ -2502,28 +3004,65 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             )
             return label
 
-        self.conn_section = CollapsibleSection(
-            "Monitor Connection",
-            expanded=True,
+        # --- Tabbed CAPTURE / REVIEW sub-window ---
+        accent = self._cfg_color("text", "accent", "#00d4ff")
+        panel_bg = self._cfg_color("buttons", "normal_bg", "#1a3a52")
+        panel_fg = self._cfg_color("text", "primary", "#e8e8e8")
+        self.cr_tabs = QtWidgets.QTabWidget()
+        self.cr_tabs.setStyleSheet(
+            "QTabWidget::pane {"
+            f"  border:1px solid {accent}; border-top:none;"
+            f"  background:{panel_bg};"
+            "}"
+            "QTabBar {"
+            "  qproperty-expanding: true;"
+            "}"
+            "QTabBar::tab {"
+            "  padding:6px 16px; font-weight:600; font-size:13px;"
+            f"  background:{panel_bg}; color:{panel_fg};"
+            f"  border:1px solid {accent}; border-bottom:none;"
+            "  border-top-left-radius:4px; border-top-right-radius:4px;"
+            "  margin-right:2px;"
+            "}"
+            "QTabBar::tab:selected {"
+            f"  background:{accent}; color:#0a1428;"
+            "}"
         )
-        left.addWidget(self.conn_section)
+
+        # --- Tab 0: CAPTURE ---
+        capture_page = QtWidgets.QWidget()
+        cap_lay = QtWidgets.QVBoxLayout(capture_page)
+        cap_lay.setContentsMargins(8, 8, 8, 8)
+        cap_lay.setSpacing(6)
+
+        self.capture_toggle_btn = QtWidgets.QPushButton("START")
+        self.capture_toggle_btn.setMinimumHeight(34)
+        self.capture_toggle_btn.setAutoDefault(True)
+        self.capture_toggle_btn.setDefault(False)
+        cap_lay.addWidget(self.capture_toggle_btn)
+
+        self.apply_capture_view_btn = QtWidgets.QPushButton(
+            "Apply Capture Selection to Live View"
+        )
+        self.apply_capture_view_btn.setMinimumHeight(28)
+        cap_lay.addWidget(self.apply_capture_view_btn)
+
+        # -- Connection settings (previously conn_section) --
         self.port_combo = QtWidgets.QComboBox()
         self.baud_combo = QtWidgets.QComboBox()
         self.baud_combo.addItems(["19200", "115200"])
         self.baud_combo.setCurrentText(str(self.config["initial_baudrate"]))
-        self.refresh_ports_btn = QtWidgets.QPushButton("Refresh Ports")
-        self.conn_section.content_layout.addWidget(
-            QtWidgets.QLabel("Source Port")
-        )
+        self.refresh_ports_btn = QtWidgets.QPushButton("Refresh")
+        cap_lay.addWidget(QtWidgets.QLabel("Source Port"))
         conn_row = QtWidgets.QHBoxLayout()
         conn_row.setContentsMargins(0, 0, 0, 0)
-        conn_row.setSpacing(6)
+        conn_row.setSpacing(4)
         conn_row.addWidget(self.port_combo, 1)
         conn_row.addWidget(QtWidgets.QLabel("Baud"))
         conn_row.addWidget(self.baud_combo)
         conn_row.addWidget(self.refresh_ports_btn)
-        self.conn_section.content_layout.addLayout(conn_row)
-        
+        cap_lay.addLayout(conn_row)
+
         # Trend interval selector
         trend_interval_row = QtWidgets.QHBoxLayout()
         trend_interval_row.setContentsMargins(0, 0, 0, 0)
@@ -2538,67 +3077,78 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.trend_interval_spin.valueChanged.connect(self._on_trend_interval_changed)
         trend_interval_row.addWidget(self.trend_interval_spin)
         trend_interval_row.addStretch()
-        self.conn_section.content_layout.addLayout(trend_interval_row)
-        
-        self.conn_section.content_layout.addWidget(
-            _hint("Next: confirm monitor source and move to signal setup.")
-        )
+        cap_lay.addLayout(trend_interval_row)
 
-        self.file_save_section = CollapsibleSection(
-            "File Save Status",
-            expanded=True,
-        )
-        left.addWidget(self.file_save_section)
-        self.file_save_section.content_layout.addWidget(
-            QtWidgets.QLabel("Save Folder")
-        )
-        save_folder_row = QtWidgets.QHBoxLayout()
-        save_folder_row.setContentsMargins(0, 0, 0, 0)
-        save_folder_row.setSpacing(6)
+        # -- File paths (previously file_save_section) --
+        cap_lay.addWidget(QtWidgets.QLabel("Recording Folder"))
         self.save_folder_edit = QtWidgets.QLineEdit()
         self.save_folder_edit.setPlaceholderText("Select folder")
-        self.save_folder_browse_btn = QtWidgets.QPushButton("Browse...")
-        save_folder_row.addWidget(self.save_folder_edit, 1)
-        save_folder_row.addWidget(self.save_folder_browse_btn, 0)
-        self.file_save_section.content_layout.addLayout(save_folder_row)
-
-        self.file_save_section.content_layout.addWidget(
-            QtWidgets.QLabel("Save Filename")
+        self.save_folder_edit.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Fixed,
         )
+        self.save_folder_edit.setMinimumWidth(60)
+        cap_lay.addWidget(self.save_folder_edit)
+        self.save_folder_browse_btn = QtWidgets.QPushButton("Browse...")
+        cap_lay.addWidget(self.save_folder_browse_btn)
+
+        cap_lay.addWidget(QtWidgets.QLabel("Recording Filename"))
         self.save_filename_edit = QtWidgets.QLineEdit()
         self.save_filename_edit.setPlaceholderText("record.drc")
-        self.file_save_section.content_layout.addWidget(self.save_filename_edit)
-
-        self.file_save_section.content_layout.addWidget(
-            QtWidgets.QLabel("Planned Save Path")
-        )
-        self.save_target_preview_label = QtWidgets.QLabel("")
-        self.save_target_preview_label.setWordWrap(True)
-        self.save_target_preview_label.setSizePolicy(
+        self.save_filename_edit.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Fixed,
         )
-        self.save_target_preview_label.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse
-        )
-        self.file_save_section.content_layout.addWidget(
-            self.save_target_preview_label
-        )
+        self.save_filename_edit.setMinimumWidth(60)
+        cap_lay.addWidget(self.save_filename_edit)
+        self.save_filename_browse_btn = QtWidgets.QPushButton("Browse...")
+        cap_lay.addWidget(self.save_filename_browse_btn)
 
-        self.file_save_section.content_layout.addWidget(
-            QtWidgets.QLabel("Current DRC File")
-        )
         self.save_file_name_label = QtWidgets.QLabel("No output file")
-        self.save_file_name_label.setWordWrap(True)
-        self.save_file_name_label.setSizePolicy(
+        self.save_file_name_label.setVisible(False)
+
+        cap_lay.addWidget(QtWidgets.QLabel("Record Duration (sec)"))
+        self.duration_spin = QtWidgets.QSpinBox()
+        self.duration_spin.setRange(5, 3600)
+        self.duration_spin.setValue(self.config["initial_duration"])
+        cap_lay.addWidget(self.duration_spin)
+        cap_lay.addStretch()
+
+        self.cr_tabs.addTab(capture_page, "  CAPTURE  ")
+
+        # --- Tab 1: REVIEW ---
+        review_page = QtWidgets.QWidget()
+        rev_lay = QtWidgets.QVBoxLayout(review_page)
+        rev_lay.setContentsMargins(8, 8, 8, 8)
+        rev_lay.setSpacing(6)
+
+        self.review_btn = QtWidgets.QPushButton("REVIEW")
+        self.review_btn.setMinimumHeight(34)
+        self.review_btn.setEnabled(False)
+        self.exit_review_btn = QtWidgets.QPushButton("Exit Review")
+        self.exit_review_btn.setMinimumHeight(28)
+        self.exit_review_btn.setVisible(False)
+        rev_btn_row = QtWidgets.QHBoxLayout()
+        rev_btn_row.setContentsMargins(0, 0, 0, 0)
+        rev_btn_row.setSpacing(6)
+        rev_btn_row.addWidget(self.review_btn, 1)
+        rev_btn_row.addWidget(self.exit_review_btn, 0)
+        rev_lay.addLayout(rev_btn_row)
+
+        rev_lay.addWidget(QtWidgets.QLabel("Review File (Input)"))
+        self.review_file_edit = QtWidgets.QLineEdit()
+        self.review_file_edit.setPlaceholderText("Select a DRC file for review")
+        self.review_file_edit.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
-            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Fixed,
         )
-        self.save_file_name_label.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse
-        )
-        self.file_save_section.content_layout.addWidget(
-            self.save_file_name_label
+        self.review_file_edit.setMinimumWidth(60)
+        rev_lay.addWidget(self.review_file_edit)
+        self.review_file_browse_btn = QtWidgets.QPushButton("Open...")
+        rev_lay.addWidget(self.review_file_browse_btn)
+
+        rev_lay.addWidget(
+            _hint("Open review file does not change capture output settings.")
         )
 
         self.convert_csv_btn = QtWidgets.QPushButton(
@@ -2607,13 +3157,11 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.convert_csv_btn.setVisible(False)
         self.convert_csv_btn.setEnabled(False)
         self.convert_csv_btn.clicked.connect(self.convert_current_drc_to_csv)
-        self.file_save_section.content_layout.addWidget(self.convert_csv_btn)
+        rev_lay.addWidget(self.convert_csv_btn)
 
-        self.convert_saved_header = QtWidgets.QLabel("Saved CSV Files")
+        self.convert_saved_header = QtWidgets.QLabel("Generated CSV Files")
         self.convert_saved_header.setVisible(False)
-        self.file_save_section.content_layout.addWidget(
-            self.convert_saved_header
-        )
+        rev_lay.addWidget(self.convert_saved_header)
 
         self.convert_saved_list = QtWidgets.QListWidget()
         self.convert_saved_list.setVisible(False)
@@ -2626,31 +3174,59 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         self.convert_saved_list.setFocusPolicy(QtCore.Qt.NoFocus)
         self.convert_saved_list.setTextElideMode(QtCore.Qt.ElideLeft)
-        self.file_save_section.content_layout.addWidget(
-            self.convert_saved_list
-        )
+        rev_lay.addWidget(self.convert_saved_list)
 
-        self.file_save_section.content_layout.addWidget(
-            _hint("Blue: appending. Green: closed and ready to convert.")
+        self.log_file_header = QtWidgets.QLabel("Capture Log")
+        self.log_file_header.setVisible(False)
+        rev_lay.addWidget(self.log_file_header)
+        self.log_file_label = QtWidgets.QLabel("")
+        self.log_file_label.setVisible(False)
+        self.log_file_label.setWordWrap(True)
+        self.log_file_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
         )
+        self.log_file_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        rev_lay.addWidget(self.log_file_label)
+        rev_lay.addStretch()
+
+        self.cr_tabs.addTab(review_page, "  REVIEW  ")
+        left.addWidget(self.cr_tabs)
+
+        # Stub CollapsibleSection-like objects so _all_lockable_sections works
+        self.conn_section = type("_Stub", (), {
+            "title": "Monitor Connection",
+            "is_locked": False,
+            "set_locked": lambda self, v: None,
+            "toggle_btn": type("_Btn", (), {
+                "isChecked": lambda self: True,
+                "setChecked": lambda self, v: None,
+            })(),
+        })()
+        self.file_save_section = type("_Stub", (), {
+            "title": "DRC File Paths",
+            "is_locked": False,
+            "set_locked": lambda self, v: None,
+            "toggle_btn": type("_Btn", (), {
+                "isChecked": lambda self: True,
+                "setChecked": lambda self, v: None,
+            })(),
+        })()
+
         self.save_folder_edit.setText(self.output_directory)
         self.save_filename_edit.setText(self.output_filename)
         self._sync_output_target_from_inputs()
+        self.review_file_edit.setText(self.review_source_file)
+        self._sync_review_source_from_input()
         self._set_file_save_status("default", "")
 
         self.view_section = CollapsibleSection(
-            "Session Setup",
+            "Screen Setup",
             expanded=True,
         )
         left.addWidget(self.view_section)
-
-        self.duration_spin = QtWidgets.QSpinBox()
-        self.duration_spin.setRange(5, 3600)
-        self.duration_spin.setValue(self.config["initial_duration"])
-        self.view_section.content_layout.addWidget(
-            QtWidgets.QLabel("Record Duration (sec)")
-        )
-        self.view_section.content_layout.addWidget(self.duration_spin)
 
         self.hr_window_spin = QtWidgets.QSpinBox()
         self.hr_window_spin.setRange(10, 3600)
@@ -2947,16 +3523,25 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         self.refresh_ports_btn.clicked.connect(self.refresh_ports)
+        self.port_combo.currentIndexChanged.connect(self._on_port_combo_changed)
+        self.cr_tabs.currentChanged.connect(self._on_tab_changed)
         self.capture_toggle_btn.clicked.connect(self._on_capture_toggle_clicked)
         self.review_btn.clicked.connect(self._on_review_clicked)
+        self.exit_review_btn.clicked.connect(self._on_exit_review_clicked)
+        self.apply_capture_view_btn.clicked.connect(
+            self._on_apply_capture_view_clicked
+        )
         self.review_slider.valueChanged.connect(self._on_review_slider_changed)
         self.hr_window_spin.valueChanged.connect(self.update_plots)
         self.ecg_window_spin.valueChanged.connect(self.update_plots)
         self.graph_splitter.splitterMoved.connect(self.on_splitter_moved)
         self.duration_spin.valueChanged.connect(self._save_runtime_config)
         self.save_folder_browse_btn.clicked.connect(self._on_browse_output_folder)
+        self.save_filename_browse_btn.clicked.connect(self._on_browse_output_filename)
+        self.review_file_browse_btn.clicked.connect(self._on_browse_review_file)
         self.save_folder_edit.editingFinished.connect(self._on_output_target_edited)
         self.save_filename_edit.editingFinished.connect(self._on_output_target_edited)
+        self.review_file_edit.editingFinished.connect(self._on_review_source_edited)
 
     def _set_capture_button_state(self, state):
         if state == "recording":
@@ -2977,6 +3562,73 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
                 self._wave_button_style_for_state("blue")
             )
             self.capture_toggle_btn.setDefault(False)
+        if hasattr(self, "review_btn"):
+            self._refresh_review_button_state()
+        if hasattr(self, "mode_badge_label"):
+            self._update_mode_ui()
+
+    def _update_mode_ui(self):
+        if self.review_mode:
+            review_name = ""
+            if self.review_file_path:
+                review_name = Path(self.review_file_path).name
+            text = "Mode: Reviewing"
+            if review_name:
+                text += f" ({review_name})"
+            self.mode_badge_label.setText(text)
+            self.mode_badge_label.setStyleSheet(
+                "padding:4px 8px;border-radius:4px;"
+                "font-weight:600;background:#ffd166;color:#1a1a1a;"
+            )
+            self.exit_review_btn.setVisible(True)
+            self.apply_capture_view_btn.setEnabled(False)
+            self.apply_capture_view_btn.setToolTip(
+                "Exit review to apply capture selection"
+            )
+            if hasattr(self, "cr_tabs"):
+                self.cr_tabs.setCurrentIndex(1)
+            return
+
+        port_text = self._selected_port()
+        if self._is_capture_running() and port_text:
+            mode_text = f"Mode: Live Capture ({port_text})"
+        elif port_text:
+            mode_text = f"Mode: Capture Setup ({port_text})"
+        else:
+            mode_text = "Mode: Capture Setup"
+        self.mode_badge_label.setText(mode_text)
+        self.mode_badge_label.setStyleSheet(
+            "padding:4px 8px;border-radius:4px;"
+            "font-weight:600;background:#00d4ff;color:#0a1428;"
+        )
+        self.exit_review_btn.setVisible(False)
+        self.apply_capture_view_btn.setEnabled(True)
+        self.apply_capture_view_btn.setToolTip(
+            "Refresh live view using capture selections"
+        )
+        if hasattr(self, "cr_tabs"):
+            self.cr_tabs.setCurrentIndex(0)
+
+    def _on_exit_review_clicked(self):
+        if not self.review_mode:
+            return
+        self._clear_review_state()
+        self._update_graph_header()
+        self.update_plots(force=True)
+        self.update_plots()
+        self.log("Review closed; returned to capture context")
+        self._update_mode_ui()
+
+    def _on_apply_capture_view_clicked(self):
+        if self.review_mode:
+            self.log("Exit review before applying capture selection")
+            return
+        self._rebuild_trend_plots()
+        self._rebuild_wave_plots()
+        self.update_plots(force=True)
+        self.update_plots()
+        self.log("Applied capture selection to live view")
+        self._update_mode_ui()
 
     def _on_capture_toggle_clicked(self):
         if self._is_capture_running():
@@ -3222,15 +3874,152 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         except RuntimeError:
             pass
 
+    def _selected_port(self) -> str:
+        """Return the raw COM port name from the port combo (strips annotation)."""
+        idx = self.port_combo.currentIndex()
+        if idx < 0:
+            return ""
+        data = self.port_combo.itemData(idx)
+        if data:
+            return str(data)
+        # Fallback: text might be plain port name
+        return str(self.port_combo.currentText() or "").strip()
+
     def refresh_ports(self):
-        current = self.port_combo.currentText()
+        """Start port scan in background thread."""
+        if self.port_scan_active:
+            return  # Scan already in progress
+        
+        self.port_scan_active = True
+        self.refresh_ports_btn.setEnabled(False)
+        self.refresh_ports_btn.setText("Scanning...")
+        
+        # Populate port list without highlighting first
+        current = self._selected_port()
         self.port_combo.clear()
-        ports = [p.device for p in list_ports.comports()]
-        self.port_combo.addItems(sorted(ports))
+        ports = sorted({p.device for p in list_ports.comports()})
+        ports = sorted(
+            ports,
+            key=lambda name: (
+                int(name[3:]) if name.upper().startswith("COM") and name[3:].isdigit() else -1,
+                name,
+            ),
+            reverse=True,
+        )
+        for port in ports:
+            self.port_combo.addItem(port, userData=port)
         if current:
-            idx = self.port_combo.findText(current)
+            idx = self.port_combo.findData(current)
             if idx >= 0:
                 self.port_combo.setCurrentIndex(idx)
+        self.log(f"Ports: {', '.join(ports) if ports else 'none'} (scanning...)")
+        
+        # Start port scan worker
+        if self.port_scan_worker is not None and self.port_scan_worker.isRunning():
+            self.port_scan_worker.request_stop()
+            self.port_scan_worker.wait(timeout=2000)
+        
+        self.port_scan_worker = PortScanWorker(parent=self)
+        self.port_scan_worker.results_signal.connect(self._on_port_scan_results)
+        self.port_scan_worker.finished_signal.connect(self._on_port_scan_finished)
+        self.port_scan_worker.error_signal.connect(self._on_port_scan_error)
+        self.port_scan_worker.start()
+
+    def _on_port_scan_results(self, results):
+        """Handle port scan results: apply green styling to successful items."""
+        self.port_scan_results = results
+        success_pairs = results.get("success_pairs", [])
+        
+        # Apply green highlight to successful port/baud combinations
+        for i in range(self.port_combo.count()):
+            port = self.port_combo.itemData(i)
+            if not port:
+                port = self.port_combo.itemText(i)
+            
+            # Check if this port is in any successful pair
+            is_success = any(p == port for p, b in success_pairs)
+            
+            if is_success:
+                # Apply green background
+                self.port_combo.setItemData(i, QtGui.QBrush(QtGui.QColor(100, 200, 100)), QtCore.Qt.BackgroundRole)
+                self.port_combo.setItemData(i, QtGui.QColor(0, 0, 0), QtCore.Qt.ForegroundRole)
+            else:
+                # Reset to default
+                self.port_combo.setItemData(i, None, QtCore.Qt.BackgroundRole)
+                self.port_combo.setItemData(i, None, QtCore.Qt.ForegroundRole)
+        
+        # Apply green highlight to successful baud rates
+        for i in range(self.baud_combo.count()):
+            baud_text = self.baud_combo.itemText(i)
+            try:
+                baud = int(baud_text)
+            except (ValueError, TypeError):
+                baud = None
+            
+            current_port = self._selected_port()
+            is_success = any(p == current_port and b == baud for p, b in success_pairs)
+            
+            if is_success:
+                self.baud_combo.setItemData(i, QtGui.QBrush(QtGui.QColor(100, 200, 100)), QtCore.Qt.BackgroundRole)
+                self.baud_combo.setItemData(i, QtGui.QColor(0, 0, 0), QtCore.Qt.ForegroundRole)
+            else:
+                self.baud_combo.setItemData(i, None, QtCore.Qt.BackgroundRole)
+                self.baud_combo.setItemData(i, None, QtCore.Qt.ForegroundRole)
+        
+        self.log(f"Port scan complete: {len(success_pairs)} monitor(s) detected")
+
+    def _on_port_scan_finished(self):
+        """Called when port scan completes."""
+        self.port_scan_active = False
+        self.refresh_ports_btn.setEnabled(True)
+        self.refresh_ports_btn.setText("Refresh")
+        
+        # Set tooltip with scan results
+        tooltip_text = self.port_scan_results.get("tooltip_text", "No results")
+        self.refresh_ports_btn.setToolTip(tooltip_text)
+
+    def _on_port_scan_error(self, error_msg):
+        """Called if port scan encounters an error."""
+        self.port_scan_active = False
+        self.refresh_ports_btn.setEnabled(True)
+        self.refresh_ports_btn.setText("Refresh")
+        self.log(f"Port scan error: {error_msg}")
+        self.refresh_ports_btn.setToolTip(f"Error: {error_msg}")
+
+    def _on_port_combo_changed(self, index):
+        """Update baud highlight when port selection changes."""
+        if not self.port_scan_results or not self.port_scan_results.get("success_pairs"):
+            return
+        
+        success_pairs = self.port_scan_results.get("success_pairs", [])
+        current_port = self._selected_port()
+        
+        # Reapply baud highlighting for the newly selected port
+        for i in range(self.baud_combo.count()):
+            baud_text = self.baud_combo.itemText(i)
+            try:
+                baud = int(baud_text)
+            except (ValueError, TypeError):
+                baud = None
+            
+            is_success = any(p == current_port and b == baud for p, b in success_pairs)
+            
+            if is_success:
+                self.baud_combo.setItemData(i, QtGui.QBrush(QtGui.QColor(100, 200, 100)), QtCore.Qt.BackgroundRole)
+                self.baud_combo.setItemData(i, QtGui.QColor(0, 0, 0), QtCore.Qt.ForegroundRole)
+            else:
+                self.baud_combo.setItemData(i, None, QtCore.Qt.BackgroundRole)
+                self.baud_combo.setItemData(i, None, QtCore.Qt.ForegroundRole)
+
+    def _on_tab_changed(self, index):
+        """Block switching to REVIEW tab while capture is recording."""
+        if index == 1 and self._is_capture_running():
+            self.cr_tabs.blockSignals(True)
+            self.cr_tabs.setCurrentIndex(0)
+            self.cr_tabs.blockSignals(False)
+            self.log("Stop capture before switching to Review")
+
+
 
     def _split_ratios(self):
         sizes = self.graph_splitter.sizes()
@@ -3271,8 +4060,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
 
         self.update_plots()
 
-    def start_capture(self):
-        port = self.port_combo.currentText().strip()
+    def start_capture(self, broadcast=True):
+        port = self._selected_port()
         if not port:
             self.log("No COM port selected")
             return
@@ -3342,6 +4131,8 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         self._update_graph_header()
         self.worker.start()
+        if broadcast:
+            self._broadcast_to_peers("start")
 
     def on_file_status(self, state, output_file):
         if state == "appending":
@@ -3351,12 +4142,17 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             return
         if state == "closed":
             self._set_file_save_status("green", output_file)
+            self.review_file_edit.setText(str(output_file))
+            self._sync_review_source_from_input()
+            self.last_active_drc_file = str(output_file)
             self.log(f"Closed file: {Path(output_file).name}")
 
-    def stop_capture(self):
+    def stop_capture(self, broadcast=True):
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_stop()
             self.log("Stop requested")
+            if broadcast:
+                self._broadcast_to_peers("stop")
 
     def _is_capture_running(self):
         return bool(
@@ -3393,27 +4189,51 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
     def _on_control_stop(self):
         # Marshal control-thread requests to the Qt main thread.
         QtCore.QTimer.singleShot(0, self._apply_control_stop)
-        return "stopping gui"
+        return "stopping capture"
 
     def _apply_control_stop(self):
         self.log("Remote stop requested")
-        self.stop_capture()
-        self._close_after_remote_stop(deadline=time.monotonic() + 5.0)
+        self.stop_capture(broadcast=False)
 
-    def _close_after_remote_stop(self, deadline):
-        if self.worker is not None and self.worker.isRunning():
-            if time.monotonic() >= deadline:
-                self.log("Remote stop timeout reached; closing window")
-                self._allow_close_during_capture = True
-                self.close()
-                return
-            QtCore.QTimer.singleShot(
-                150,
-                lambda: self._close_after_remote_stop(deadline),
-            )
+    def _on_control_start(self):
+        QtCore.QTimer.singleShot(0, self._apply_control_start)
+        return "starting capture"
+
+    def _apply_control_start(self):
+        if self._is_capture_running():
+            self.log("Remote start ignored (already running)")
             return
-        self._allow_close_during_capture = True
-        self.close()
+        self.log("Remote start requested")
+        self.start_capture(broadcast=False)
+
+    def _discover_peers(self):
+        """Find other pyCollect instances listening on nearby control ports."""
+        if self.control_port <= 0:
+            return
+        self._peer_ports = []
+        # Scan a small range around the configured port
+        for offset in range(1, 6):
+            peer = self.control_port + offset
+            if LocalControlServer.is_peer_listening(peer):
+                self._peer_ports.append(peer)
+                self.log(f"Peer instance detected on port {peer}")
+            peer = self.control_port - offset
+            if peer > 0 and LocalControlServer.is_peer_listening(peer):
+                self._peer_ports.append(peer)
+                self.log(f"Peer instance detected on port {peer}")
+
+    def _broadcast_to_peers(self, command):
+        """Send a command to all known peer instances."""
+        self._discover_peers()
+        for peer_port in self._peer_ports:
+            try:
+                resp = LocalControlServer.send_command(
+                    peer_port, command, timeout=0.1
+                )
+                if resp:
+                    self.log(f"Peer :{peer_port} {command} -> {resp}")
+            except Exception:
+                pass
 
     def _on_control_status(self):
         running = bool(
@@ -3422,7 +4242,7 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         )
         return (
             f"running={running} "
-            f"port={self.port_combo.currentText()} "
+            f"port={self._selected_port()} "
             f"baud={self.baud_combo.currentText()}"
         )
 
@@ -3659,8 +4479,13 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
             )
 
             slider_text = f"{self.review_record_index + 1}/{len(self.review_records)}"
-            if record_dt is not None:
-                slider_text += f"  {record_dt.strftime('%H:%M:%S')}"
+            # Show total file duration
+            last_info = self.review_records[-1]
+            total_sec = float(last_info.get("start_time", 0.0))
+            th = int(total_sec) // 3600
+            tm = (int(total_sec) % 3600) // 60
+            ts = int(total_sec) % 60
+            slider_text += f"  ({th:02d}:{tm:02d}:{ts:02d})"
             self.review_slider_value_label.setText(slider_text)
             return
 
@@ -4014,18 +4839,20 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         self.update_plots()
         self.sim_idle_timer.stop()
         self.capture_started_monotonic = None
-        self.log(f"Capture finished. Saved: {output_file}")
+        self.log(f"Capture finished. File: {output_file}")
         self._set_capture_button_state("idle")
-        if self.current_output_file and Path(self.current_output_file).exists():
-            self.review_btn.setEnabled(True)
+        self._refresh_review_button_state()
         self._allow_close_during_capture = False
+        self._update_mode_ui()
 
     def on_error(self, error_message):
         self.sim_idle_timer.stop()
         self.capture_started_monotonic = None
         self.log(f"ERROR: {error_message}")
         self._set_capture_button_state("idle")
+        self._refresh_review_button_state()
         self._allow_close_during_capture = False
+        self._update_mode_ui()
 
     def _on_simulation_idle_timeout(self):
         self.log("No package for 10 seconds in simulation mode")
@@ -4179,6 +5006,10 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         data["ui"]["wave_window_sec"] = float(self.ecg_window_spin.value())
         data["ui"]["output_directory"] = str(self.output_directory)
         data["ui"]["output_filename"] = str(self.output_filename)
+        data["ui"]["review_file"] = str(self.review_source_file)
+        data["ui"]["last_active_drc_file"] = str(
+            self.last_active_drc_file
+        )
         data["ui"]["connection"]["baudrate"] = int(
             self.baud_combo.currentText() or "19200"
         )
@@ -4224,6 +5055,17 @@ class PyCollectQtWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            if getattr(self, "worker", None) and self.worker.isRunning():
+                self.worker.request_stop()
+                self.worker.wait(5000)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "csv_worker", None) and self.csv_worker.isRunning():
+                self.csv_worker.wait(5000)
+        except Exception:
+            pass
+        try:
             self.control_server.stop()
         except Exception:
             pass
@@ -4235,6 +5077,8 @@ def main():
     _startup_log(
         f"qt main start frozen={getattr(sys, 'frozen', False)} argv={sys.argv!r}"
     )
+    raw_argv = list(sys.argv[1:])
+
     parser = argparse.ArgumentParser(
         description="Interactive Qt GUI for pycollect capture."
     )
@@ -4296,6 +5140,39 @@ def main():
 
     cfg_path = args.config.strip() if args.config else None
 
+    # If another instance is already on the control port, scan upward for a
+    # free port.  Instance number = 1 + offset from base port.
+    instance_number = 1
+    if args.control_port > 0:
+        base_port = args.control_port
+        while LocalControlServer.is_peer_listening(args.control_port):
+            args.control_port += 1
+            instance_number = args.control_port - base_port + 1
+        if instance_number > 1:
+            _startup_log(
+                f"Peer(s) detected; using control port {args.control_port}"
+                f" (instance {instance_number})"
+            )
+    instance_suffix = f"_{instance_number}" if instance_number > 1 else ""
+
+    if instance_suffix and not cfg_path:
+        # Load the default config first to find the working path,
+        # then derive a _2 copy from it.
+        try:
+            base_config = load_signal_config(None)
+            base_path = Path(base_config["path"])
+            alt_path = base_path.with_name(
+                base_path.stem + instance_suffix + base_path.suffix
+            )
+            if not alt_path.exists():
+                import shutil
+                shutil.copy2(str(base_path), str(alt_path))
+                _startup_log(f"Created instance config: {alt_path.name}")
+            cfg_path = str(alt_path)
+            _startup_log(f"Using config: {cfg_path}")
+        except Exception:
+            _startup_log("Could not derive _2 config; using default")
+
     try:
         config = load_signal_config(cfg_path)
     except Exception as exc:
@@ -4336,6 +5213,10 @@ def main():
     else:
         initial_duration = config["initial_duration"]
 
+    default_launch = len(raw_argv) == 0
+
+    instance_id = instance_number
+
     win = PyCollectQtWindow(
         config=config,
         output_name=args.output.strip(),
@@ -4346,6 +5227,8 @@ def main():
         debug_stdout=args.debug_stdout,
         control_port=args.control_port,
         no_rtscts=args.no_rtscts,
+        auto_open_last_review=default_launch,
+        instance_id=instance_id,
     )
     if icon_path is not None:
         win.setWindowIcon(QtGui.QIcon(str(icon_path)))
