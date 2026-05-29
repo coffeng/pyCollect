@@ -1130,3 +1130,173 @@ Legend:
 8. **Trend interval upper bound**: raise `trend_interval_spin` maximum from 120 s to 3600 s to meet PS_008.
 9. **All section headers should be lockable**: currently only Monitor Connection, Session Setup, and Monitoring Control are lockable; extend to all collapsible sections.
 10. **User role does not impact locking behavior yet**: the Administrator/Reviewer/Recorded role selector is present but does not enforce role-based lock policies on sections.
+
+---
+
+## Feature Plan: Notes and Markers (PS_COLLECT_UI_009 / PS_COLLECT_UI_010)
+
+### Background
+
+The original S/5 Collect (iCollect) included a dedicated Notes editor accessible during live collection and in offline review. From the iCollect manual (page 23):
+
+> *"You can enter and modify case notes by selecting Edit – Notes (Ctrl+N). You can select notes from a predefined list, or enter notes of your own — for example drug administrations and their effects on the patient. The note is added in the list of notes together with a timestamp. To enter a note that is not predefined, first insert a timestamp by Add Date + Time, then enter the note manually."*
+
+Key legacy behaviors to preserve:
+
+- Notes stored to a `.txt` file named after the case (same root as the DRC file).
+- Predefined notes selectable from a list (legacy `notes.lst`).
+- Each note entry carries a timestamp derived from monitor or PC clock.
+- Marker events (from patient monitor Snapshot button) appear automatically in notes.
+- Notes editable both during capture (online) and in review mode (offline).
+- Notes not included when exporting to ASCII/CSV only.
+
+This maps to open requirements PS_COLLECT_UI_009 and PS_COLLECT_UI_010 (both currently ❌).
+
+---
+
+### Proposed GUI Location
+
+A new collapsible sidebar section **`Case Notes`** added to the **CAPTURE** tab, positioned below `Trends Selection` and above `Recorder Output`.
+
+The section is also visible and editable in **REVIEW** mode, loading notes associated with the open DRC file.
+
+---
+
+### UI Layout (Sidebar Section)
+
+```
+┌─ Case Notes ─────────────────────────────────────────────────┐
+│  [ Insert Timestamp ]  [ Add Template ▾ ]  [ Delete Row ]    │
+│                                                               │
+│  ┌──────────────────────┬────────────────────────────────┐   │
+│  │ Time                 │ Note                           │   │
+│  ├──────────────────────┼────────────────────────────────┤   │
+│  │ 2026-05-29 17:06:13  │ SpO2 low                       │   │
+│  │ 2026-05-29 17:07:10  │ Drug administered              │   │
+│  │ 2026-05-29 17:09:42  │ MARKER-003                     │   │
+│  └──────────────────────┴────────────────────────────────┘   │
+│  [ Clear All ]                            Ctrl+N / Ctrl+T    │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Both columns are directly editable in the table. Double-clicking a Note cell opens a multiline text popup for longer entries.
+
+---
+
+### Controls
+
+| Control | Action |
+|---|---|
+| `Insert Timestamp` (Ctrl+T) | Adds a new row with current timestamp in Time column; focuses Note column for typing |
+| `Add Template ▾` | Dropdown populated from JSON config; inserts selected text into Note column of a new timestamped row |
+| `Delete Row` | Removes selected row(s) |
+| `Clear All` | Confirms then clears entire note list |
+| Ctrl+N | Focuses / expands the Case Notes section |
+
+---
+
+### Timestamp Behavior
+
+Timestamp source priority when inserting:
+
+1. **Monitor time** — derived from the last received DRC record header timestamp, converted to local time.
+2. **PC time** — fallback when capture is not active or monitor time is unavailable.
+
+Each note row stores these fields internally:
+
+| Field | Description |
+|---|---|
+| `display_time` | What is shown in the Time column (ISO 8601 local format) |
+| `monitor_time_utc` | UTC monitor time if available, else empty |
+| `pc_time_utc` | PC wall-clock UTC at moment of insertion (always populated) |
+| `time_source` | `monitor` or `pc` |
+
+This ensures timestamps are unambiguous regardless of clock offset between PC and monitor.
+
+---
+
+### Output File Format
+
+Notes are saved alongside the DRC file using the same filename root with `.txt` extension:
+
+```
+output/record_20260529_170235.drc           ← recording
+output/record_20260529_170235.txt           ← notes file (this feature)
+output/record_20260529_170235_trends.csv
+```
+
+File format (plain UTF-8, one entry per line):
+
+```
+# pyCollect Case Notes
+# Case: record_20260529_170235.drc
+# Start: 2026-05-29 16:54:41 UTC (PC)
+# Time source: monitor_then_pc
+
+2026-05-29 17:06:13 | SpO2 low
+2026-05-29 17:07:10 | Drug administered
+2026-05-29 17:09:42 | MARKER-003
+```
+
+The file is written incrementally during capture and finalized on stop. It is reopened automatically in review mode when the matching DRC file is opened.
+
+---
+
+### JSON Configuration Extension
+
+New section to add to `pycollect_gui_config.json` (and `pycollect_gui_config.default.json`):
+
+```json
+"notes": {
+  "enabled": true,
+  "default_time_source": "monitor_then_pc",
+  "autosave_interval_sec": 30,
+  "templates": [
+    "Drug administered",
+    "Intubation start",
+    "Artifact suspected",
+    "Position changed",
+    "Manual event",
+    "SpO2 probe replaced",
+    "BP cuff inflated",
+    "Ventilator change"
+  ]
+}
+```
+
+Templates are user-editable in the JSON and reloaded on next launch. The `Add Template` dropdown in the GUI shows all entries from this list.
+
+---
+
+### Review Mode Integration
+
+- When a DRC is opened for review, pyCollect checks for a `.txt` sidecar at the same path.
+- If found, the Case Notes section is populated from the file in read/edit mode.
+- Review slider position highlights the nearest note row in the table (row highlight only, no auto-scroll lock).
+- Two navigation buttons added near the review slider:
+  - `◀ Prev Note` — moves slider to the timestamp of the previous note entry.
+  - `▶ Next Note` — moves slider to the timestamp of the next note entry.
+
+---
+
+### Implementation Phases
+
+| Phase | Scope |
+|---|---|
+| 1 | UI: collapsible section, in-memory `QTableWidget` model, Insert Timestamp, Delete Row, Clear All |
+| 2 | Timestamp plumbing: expose last monitor record time from `CollectorWorker`; fallback to PC time |
+| 3 | Persistence: write `.txt` sidecar on each insert (autosave) and on capture stop/close |
+| 4 | Template config: load `notes.templates` from JSON into `Add Template` dropdown |
+| 5 | Review integration: load sidecar on DRC open; highlight nearest note row during slider navigation; add Prev/Next buttons |
+| 6 | Tests: smoke tests for insert/edit/save/load and time-source fallback |
+
+---
+
+### Acceptance Criteria
+
+1. Operator can insert a timestamped note during live capture in ≤ 2 clicks (or Ctrl+T + typing).
+2. Templates from JSON config appear in the dropdown and remain editable after insertion.
+3. Notes file is automatically saved as `<drc-root>.txt` alongside the DRC output.
+4. Timestamp source is explicit (`monitor` or `pc`) and robust to missing monitor time.
+5. Notes reload in review mode and can be navigated with Prev/Next Note buttons.
+6. Marker events generated by the patient monitor (Snapshot button) appear automatically as note rows.
